@@ -25,12 +25,18 @@ export interface Param {
   input_type?: string;
   viewstate?: ViewStateInfo;
   is_json?: boolean;
+  /** "query" = lives in the URL query string; "body" (default) = form/JSON body.
+   *  Editing a "query" param must be re-serialized into the URL, not the body. */
+  source?: "query" | "body";
 }
 
 export interface ParsedRequest {
   method: string;
   path: string;
   url: string;
+  /** URL without the query string — combine with edited query params to rebuild the final URL. */
+  url_base?: string;
+  scheme?: "http" | "https";
   http_version: string;
   headers: Record<string, string>;
   body: string;
@@ -38,6 +44,7 @@ export interface ParsedRequest {
   content_type: string;
   is_ajax: boolean;
   is_aspnet: boolean;
+  has_query_params?: boolean;
 }
 
 export interface AjaxPart {

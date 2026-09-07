@@ -168,6 +168,26 @@ def decode_viewstate(vs: str) -> Dict:
 
 # ── HTTP parser ───────────────────────────────────────────────────────────────
 
+def _parse_query_params(query_string: str) -> List[Dict]:
+    """Parse a URL query string into editable params tagged source='query'."""
+    params: List[Dict] = []
+    for pair in query_string.split("&"):
+        if not pair:
+            continue
+        if "=" in pair:
+            k, _, v = pair.partition("=")
+            dk, dv = unquote_plus(k), unquote_plus(v)
+        else:
+            dk, dv = unquote_plus(pair), ""
+        ptype = classify_param(dk)
+        params.append({
+            "name": dk, "raw_name": k if "=" in pair else pair,
+            "value": dv, "raw_value": v if "=" in pair else "",
+            "type": ptype, "editable": True, "source": "query",
+        })
+    return params
+
+
 def _build_params(body: str, content_type: str) -> List[Dict]:
     params: List[Dict] = []
     if "application/x-www-form-urlencoded" not in content_type:
@@ -178,7 +198,8 @@ def _build_params(body: str, content_type: str) -> List[Dict]:
                     params.append({
                         "name": k, "raw_name": k,
                         "value": json.dumps(v) if isinstance(v, (dict, list)) else str(v),
-                        "raw_value": str(v), "type": "user", "editable": True, "is_json": True,
+                        "raw_value": str(v), "type": "user", "editable": True,
+                        "is_json": True, "source": "body",
                     })
             except Exception:
                 pass
@@ -192,7 +213,7 @@ def _build_params(body: str, content_type: str) -> List[Dict]:
             ptype = classify_param(dk)
             p: Dict = {
                 "name": dk, "raw_name": k, "value": dv, "raw_value": v,
-                "type": ptype, "editable": ptype == "user",
+                "type": ptype, "editable": ptype == "user", "source": "body",
             }
             if dk in ("__VIEWSTATE", "__EVENTVALIDATION"):
                 p["viewstate"] = decode_viewstate(dv)
@@ -200,11 +221,26 @@ def _build_params(body: str, content_type: str) -> List[Dict]:
         else:
             dk = unquote_plus(pair)
             params.append({"name": dk, "raw_name": pair, "value": "", "raw_value": "",
-                           "type": classify_param(dk), "editable": True})
+                           "type": classify_param(dk), "editable": True, "source": "body"})
     return params
 
 
-def parse_raw_http(raw: str) -> Dict:
+def _infer_scheme(host: str, force_scheme: Optional[str]) -> str:
+    """
+    Raw pasted HTTP requests carry no scheme. Production ASP.NET targets are
+    overwhelmingly HTTPS, so that's the default — but legacy/intranet ASP.NET
+    apps commonly run plaintext HTTP, and an explicit ':80' in the Host header
+    is an unambiguous signal for that. force_scheme (from the UI toggle) always
+    wins when the caller knows better than either heuristic.
+    """
+    if force_scheme in ("http", "https"):
+        return force_scheme
+    if host.endswith(":80"):
+        return "http"
+    return "https"
+
+
+def parse_raw_http(raw: str, force_scheme: Optional[str] = None) -> Dict:
     lines = raw.replace("\r\n", "\n").split("\n")
     if not lines: raise ValueError("Empty request")
     m = re.match(r"^(\w+)\s+(\S+)\s+(HTTP/[\d.]+)\s*$", lines[0].strip(), re.I)
@@ -221,15 +257,24 @@ def parse_raw_http(raw: str) -> Dict:
     body = "\n".join(lines[i + 1:]).strip() if i + 1 < len(lines) else ""
     ct   = headers.get("Content-Type", "")
     host = headers.get("Host", "")
-    url  = f"https://{host}{path}"
-    params = _build_params(body, ct)
+    scheme = _infer_scheme(host, force_scheme)
+
+    path_only, _, query_string = path.partition("?")
+    url      = f"{scheme}://{host}{path}"
+    url_base = f"{scheme}://{host}{path_only}"
+
+    query_params = _parse_query_params(query_string)
+    body_params  = _build_params(body, ct)
+    params = query_params + body_params
 
     return {
-        "method": method, "path": path, "url": url,
+        "method": method, "path": path, "url": url, "url_base": url_base,
+        "scheme": scheme,
         "http_version": ver, "headers": headers, "body": body,
         "params": params, "content_type": ct,
         "is_ajax": bool(headers.get("X-Requested-With")) or "__ASYNCPOST" in body,
         "is_aspnet": any(p["name"].startswith("__") for p in params),
+        "has_query_params": bool(query_params),
     }
 
 
@@ -294,6 +339,7 @@ def _cookie_str(d: Dict[str, str]) -> str:
 
 class RawReq(BaseModel):
     raw_request: str
+    force_scheme: Optional[str] = None   # "http" | "https" | None (auto-detect)
 
 class FetchUrl(BaseModel):
     url: str
@@ -341,7 +387,7 @@ async def health():
 @app.post("/api/parse-request")
 async def api_parse_request(inp: RawReq):
     try:
-        return parse_raw_http(inp.raw_request)
+        return parse_raw_http(inp.raw_request, inp.force_scheme)
     except Exception as e:
         raise HTTPException(400, str(e))
 

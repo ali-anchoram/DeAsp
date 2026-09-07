@@ -14,6 +14,20 @@ builder.Services.AddSession(o =>
 var app = builder.Build();
 app.UseSession();
 
+// Vuln: X-AspNet-Version / X-Powered-By disclosure on every response
+app.Use(async (ctx, next) =>
+{
+    ctx.Response.OnStarting(() =>
+    {
+        ctx.Response.Headers["X-AspNet-Version"] = "4.0.30319";
+        ctx.Response.Headers["X-Powered-By"] = "ASP.NET";
+        ctx.Response.Headers["Server"] = "Microsoft-IIS/10.0";
+        // Intentionally NO CSP / X-Frame-Options / X-Content-Type-Options / HSTS anywhere
+        return Task.CompletedTask;
+    });
+    await next();
+});
+
 // ── Config ─────────────────────────────────────────────────────────────────
 const string MACHINE_KEY = "DeAspTestKey_NotSecure_ForTestingOnly_1234567890abcdef";
 const bool   MAC_ENABLED = true;   // set false to simulate disabled MAC
@@ -878,6 +892,417 @@ app.MapGet("/trace.axd", (HttpContext ctx) =>
         $"<p>Session ID: {H(ctx.Session.Id)}</p>" +
         $"<p>Username: {H(ctx.Session.GetString("username") ?? "none")}</p>"), "text/html"));
 
+// ═════════════════════════════════════════════════════════════════════════
+// BATCH 2 — broader OWASP + ASP.NET-specific coverage
+// ═════════════════════════════════════════════════════════════════════════
+
+var passwordResetTokens = new Dictionary<string, (string user, long issuedTicks)>();
+var registeredUsers = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "admin", "user", "victim" };
+
+// ── 9. ViewState cleartext info leak (isAdmin flag readable without decrypting) ──
+app.MapGet("/account/Preferences.aspx", (HttpContext ctx) =>
+{
+    var current = ctx.Session.GetString("username") ?? "guest";
+    var isAdmin = current.Equals("admin", StringComparison.OrdinalIgnoreCase);
+    // VULN: sensitive flag embedded directly in the ViewState payload string —
+    // MAC prevents *tampering* but does NOT prevent *reading* it (no encryption)
+    var vs = MakeViewState($"Prefs|v1|user={current}|isAdmin={isAdmin}|theme=light");
+    var html =
+        "<h2>Preferences</h2>" +
+        "<form method='POST' action='/account/Preferences.aspx'>" +
+        $"<input type='hidden' name='__VIEWSTATE' value='{vs}' />" +
+        $"<input type='hidden' name='__EVENTVALIDATION' value='{MakeEV("Prefs")}' />" +
+        "<div class='field'><label>Theme<br><select name='ctl00$cphMain$ddlTheme' style='width:100%;padding:8px;border:1px solid #ccc;border-radius:4px'>" +
+        "<option>light</option><option>dark</option></select></label></div>" +
+        "<button class='btn' type='submit'>Save</button></form>" +
+        "<p class='hint'>VULN: ViewState is MAC-protected (tamper-proof) but NOT encrypted — " +
+        "decode it and you'll see 'isAdmin=" + isAdmin + "' in cleartext. EnableViewStateMac without " +
+        "viewStateEncryptionMode='Always' leaks sensitive server state to anyone who can view page source.</p>";
+    return Results.Content(Page("Preferences", html), "text/html");
+});
+app.MapPost("/account/Preferences.aspx", async (HttpContext ctx) =>
+{
+    var form = await ctx.Request.ReadFormAsync();
+    if (!VerifyViewState(form["__VIEWSTATE"].ToString()))
+    {
+        ctx.Response.StatusCode = 500;
+        await ctx.Response.WriteAsync(Page("Error", "<div class='msg-err'>ViewState MAC failed.</div>"));
+        return;
+    }
+    await ctx.Response.WriteAsync(Page("Saved", "<div class='msg-ok'>Preferences saved.</div><a href='/account/Preferences.aspx'>Back</a>"));
+});
+
+// ── 10. Debug stack trace disclosure ────────────────────────────────────────
+app.MapGet("/debug/ThrowError.aspx", (HttpContext ctx) =>
+{
+    var crash = ctx.Request.Query["crash"].ToString();
+    if (crash == "1")
+    {
+        try { throw new InvalidOperationException("Simulated unhandled exception: division by zero in ReportEngine.CalculateTotals()"); }
+        catch (Exception ex)
+        {
+            ctx.Response.StatusCode = 500;
+            var trace =
+                $"[InvalidOperationException: {H(ex.Message)}]\n" +
+                "   AspNetTarget.ReportEngine.CalculateTotals() +142\n" +
+                "   AspNetTarget.Controllers.ReportController.Generate(ReportRequest req) +88\n" +
+                "   System.Web.Mvc.ActionMethodDispatcher.Execute(ControllerContext cc, Object[] p) +23\n" +
+                "   System.Web.Mvc.Async.AsyncControllerActionInvoker.<>c__DisplayClass1.<BeginInvokeSynchronousActionMethod>b__1() +12";
+            return Results.Content(
+                "<h1>Server Error in '/' Application.</h1>" +
+                $"<h2>{H(ex.Message)}</h2>" +
+                "<p>Description: An unhandled exception occurred during the execution of the current web request. " +
+                "Please review the stack trace for more information about the error and where it originated in the code.</p>" +
+                "<h3>Stack Trace:</h3>" +
+                $"<pre style='background:#f5f5f5;padding:12px;border:1px solid #ccc;font-size:12px'>{H(trace)}</pre>" +
+                "<hr/><p><b>Version Information:</b> Microsoft .NET Framework Version:4.0.30319; ASP.NET Version:4.8.4670.0</p>",
+                "text/html");
+        }
+    }
+    return Results.Content(Page("Debug", "<h2>Debug Endpoint</h2><p>Try <code>?crash=1</code></p><p class='hint'>VULN: customErrors=Off style — full stack trace + framework version disclosed to unauthenticated users.</p>"), "text/html");
+});
+
+// ── 11. web.config / backup file exposure ───────────────────────────────────
+app.MapGet("/web.config", () => Results.Content(
+    "<?xml version=\"1.0\"?>\n<configuration>\n  <connectionStrings>\n" +
+    "    <add name=\"MainDB\" connectionString=\"Server=sql01.corp.local;Database=AppDb;User Id=sa;Password=P@ssw0rd_2024!;\" />\n" +
+    "  </connectionStrings>\n  <system.web>\n    <machineKey validationKey=\"" + MACHINE_KEY + "\" decryptionKey=\"AUTOGENERATED\" validation=\"HMACSHA1\" />\n" +
+    "    <compilation debug=\"true\" targetFramework=\"4.8\" />\n    <customErrors mode=\"Off\" />\n  </system.web>\n</configuration>",
+    "application/xml"));
+app.MapGet("/web.config.bak", () => Results.Redirect("/web.config"));
+app.MapGet("/files/backup.zip", () => Results.Content("PK\x03\x04 [simulated zip binary — contains db_backup_2024.sql, web.config, appsettings.Production.json]", "application/zip"));
+app.MapGet("/files/", () => Results.Content(Page("Index of /files/",
+    "<h2>Index of /files/</h2><table>" +
+    "<tr><td><a href='/files/backup.zip'>backup.zip</a></td><td>2024-01-15</td></tr>" +
+    "<tr><td><a href='/files/Download.aspx'>Download.aspx</a></td><td>2024-01-15</td></tr>" +
+    "<tr><td><a href='/files/db_export.csv'>db_export.csv</a></td><td>2024-02-01</td></tr>" +
+    "</table><p class='hint'>VULN: Directory listing enabled — reveals backup files not meant to be public.</p>"), "text/html"));
+
+// ── 12. Session fixation ─────────────────────────────────────────────────────
+app.MapGet("/account/SetSession.aspx", (HttpContext ctx) =>
+{
+    // VULN: accepts an attacker-supplied session identifier from the query string
+    // and binds it into the session store without regenerating on login
+    var sid = ctx.Request.Query["sid"].ToString();
+    var html = string.IsNullOrEmpty(sid)
+        ? "<h2>Session Fixation Demo</h2><p>Use <code>?sid=ATTACKER_CHOSEN_ID</code></p>"
+        : $"<h2>Session Fixation Demo</h2><div class='msg-warn'>Session cookie set to attacker-chosen value: <strong>{H(sid)}</strong></div>" +
+          "<p>If a victim now logs in using this link, their authenticated session will use the SAME session ID the attacker already knows.</p>";
+    if (!string.IsNullOrEmpty(sid))
+        ctx.Response.Cookies.Append("ASP.NET_SessionId", sid);
+    return Results.Content(Page("Session Fixation", html +
+        "<p class='hint'>VULN: Session ID accepted from an untrusted source and not regenerated on privilege change (login).</p>"), "text/html");
+});
+
+// ── 13. SQL injection (error-based simulation) ──────────────────────────────
+app.MapGet("/product/Details.aspx", (HttpContext ctx) =>
+{
+    var sku = ctx.Request.Query["sku"].ToString();
+    var html = "<h2>Product Details</h2>" +
+        "<form method='GET' action='/product/Details.aspx'><div style='display:flex;gap:8px'>" +
+        $"<input type='text' name='sku' value='{H(sku)}' placeholder='Product SKU e.g. SKU-1001' style='flex:1' />" +
+        "<button class='btn' type='submit'>Lookup</button></div></form>";
+
+    if (!string.IsNullOrEmpty(sku))
+    {
+        // Simulated raw SQL string concatenation (never actually executed)
+        var simulatedQuery = $"SELECT Id,Name,Price FROM Products WHERE Sku = '{sku}'";
+        bool hasQuote = sku.Contains('\'');
+        bool hasUnion = sku.Contains("UNION", StringComparison.OrdinalIgnoreCase);
+        html += $"<p class='hint'>Query: {H(simulatedQuery)}</p>";
+
+        if (hasQuote && !hasUnion)
+        {
+            html += "<div class='msg-err'>System.Data.SqlClient.SqlException: Unclosed quotation mark after the character string ''. " +
+                    $"Incorrect syntax near '{H(sku)}'.</div>";
+        }
+        else if (hasUnion && sku.Contains("SELECT", StringComparison.OrdinalIgnoreCase))
+        {
+            html += "<div class='msg-warn'>⚠ UNION-based injection succeeded (simulated):</div>" +
+                    "<table><tr><th>Id</th><th>Name</th><th>Price</th></tr>" +
+                    "<tr><td>1</td><td>Widget</td><td>9.99</td></tr>" +
+                    "<tr><td>injected</td><td>admin:5f4dcc3b5aa765d61d8327deb882cf99</td><td>N/A</td></tr></table>";
+        }
+        else if (sku == "SKU-1001")
+        {
+            html += "<table><tr><th>Id</th><th>Name</th><th>Price</th></tr><tr><td>1</td><td>Widget</td><td>9.99</td></tr></table>";
+        }
+        else
+        {
+            html += "<div class='msg-err'>No product found.</div>";
+        }
+    }
+    html += "<p class='hint'>VULN: SQL injection — try <code>SKU-1001'</code> or <code>' UNION SELECT username,password,3 FROM Users--</code></p>";
+    return Results.Content(Page("Product", html), "text/html");
+});
+
+// ── 14. OS command injection (simulated) ────────────────────────────────────
+app.MapGet("/admin/Ping.aspx", (HttpContext ctx) =>
+{
+    var vs = MakeViewState("Ping|v1");
+    var html =
+        "<h2>Network Diagnostic Tool</h2>" +
+        "<form method='POST' action='/admin/Ping.aspx'>" +
+        $"<input type='hidden' name='__VIEWSTATE' value='{vs}' />" +
+        "<div class='field'><label>Host<br><input type='text' name='ctl00$cphAdmin$txtHost' placeholder='8.8.8.8' /></label></div>" +
+        "<button class='btn' type='submit'>Ping</button></form>" +
+        "<p class='hint'>VULN: Try <code>8.8.8.8 &amp;&amp; whoami</code> or <code>; cat /etc/passwd</code></p>";
+    return Results.Content(Page("Ping Tool", html), "text/html");
+});
+app.MapPost("/admin/Ping.aspx", async (HttpContext ctx) =>
+{
+    var form = await ctx.Request.ReadFormAsync();
+    if (!VerifyViewState(form["__VIEWSTATE"].ToString()))
+    {
+        ctx.Response.StatusCode = 500;
+        await ctx.Response.WriteAsync(Page("Error", "<div class='msg-err'>ViewState MAC failed.</div>"));
+        return;
+    }
+    var host = form["ctl00$cphAdmin$txtHost"].ToString();
+    // Simulated shell-out (never actually executed) — string concatenation into a shell command
+    var simulatedCmd = $"/bin/ping -c 1 {host}";
+    var injected = host.IndexOfAny(new[] { ';', '&', '|', '`', '$' }) >= 0;
+    var output = injected
+        ? "<div class='msg-warn'>⚠ Command injection executed (simulated):</div><pre style='background:#f5f5f5;padding:12px'>uid=33(www-data) gid=33(www-data) groups=33(www-data)\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin</pre>"
+        : $"<div class='msg-ok'>PING {H(host)}: 1 packets transmitted, 1 received, 0% loss</div>";
+    await ctx.Response.WriteAsync(Page("Ping Result",
+        $"<p class='hint'>Command: {H(simulatedCmd)}</p>" + output + "<a href='/admin/Ping.aspx'>Back</a>"));
+});
+
+// ── 15. Path traversal / LFI ─────────────────────────────────────────────────
+var virtualFiles = new Dictionary<string, string>
+{
+    ["report1.txt"] = "Q3 Sales Report\n---------------\nRevenue: $1.2M\nGrowth: 14%",
+    ["notes.txt"]   = "Meeting notes: discuss Q4 roadmap.",
+};
+app.MapGet("/files/Download.aspx", (HttpContext ctx) =>
+{
+    var file = ctx.Request.Query["file"].ToString();
+    var html = "<h2>File Download</h2>" +
+        "<form method='GET' action='/files/Download.aspx'><div style='display:flex;gap:8px'>" +
+        $"<input type='text' name='file' value='{H(file)}' placeholder='report1.txt' style='flex:1' />" +
+        "<button class='btn' type='submit'>Download</button></div></form>";
+
+    if (!string.IsNullOrEmpty(file))
+    {
+        // VULN: no path canonicalization/allowlist check — traversal sequences pass through
+        var traversal = file.Contains("..") || file.Contains("%2e%2e", StringComparison.OrdinalIgnoreCase);
+        if (traversal && (file.Contains("web.config") || file.Contains("machineKey")))
+        {
+            html += "<div class='msg-warn'>⚠ Path traversal succeeded (simulated read of ../../web.config):</div>" +
+                    $"<pre style='background:#f5f5f5;padding:12px;font-size:11px'>&lt;machineKey validationKey=\"{H(MACHINE_KEY)}\" validation=\"HMACSHA1\" /&gt;</pre>";
+        }
+        else if (traversal)
+        {
+            html += "<div class='msg-warn'>⚠ Path traversal detected — file outside webroot would be readable in a real deployment.</div>";
+        }
+        else if (virtualFiles.TryGetValue(file, out var content))
+        {
+            html += $"<pre style='background:#f5f5f5;padding:12px'>{H(content)}</pre>";
+        }
+        else
+        {
+            html += "<div class='msg-err'>File not found.</div>";
+        }
+    }
+    html += "<p class='hint'>VULN: Try <code>../../web.config</code> or <code>..%2f..%2fweb.config</code></p>";
+    return Results.Content(Page("Download", html), "text/html");
+});
+
+// ── 16. SSRF ──────────────────────────────────────────────────────────────────
+app.MapGet("/internal/secret", () => Results.Content(
+    "INTERNAL-ONLY ENDPOINT — flag: SSRF{internal_network_reachable_via_avatar_fetch}", "text/plain"));
+
+app.MapGet("/tools/FetchUrl.aspx", async (HttpContext ctx) =>
+{
+    var url = ctx.Request.Query["url"].ToString();
+    var html = "<h2>Avatar Fetcher</h2><p>Fetch a profile picture from a URL (server-side).</p>" +
+        "<form method='GET' action='/tools/FetchUrl.aspx'><div style='display:flex;gap:8px'>" +
+        $"<input type='text' name='url' value='{H(url)}' placeholder='https://example.com/avatar.png' style='flex:1' />" +
+        "<button class='btn' type='submit'>Fetch</button></div></form>";
+
+    if (!string.IsNullOrEmpty(url))
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var resp = await http.GetAsync(url);
+            var body = await resp.Content.ReadAsStringAsync();
+            html += $"<div class='msg-info'>Status: {(int)resp.StatusCode}</div>" +
+                    $"<pre style='background:#f5f5f5;padding:12px;max-height:200px;overflow:auto'>{H(body[..Math.Min(body.Length, 500)])}</pre>";
+        }
+        catch (Exception ex)
+        {
+            html += $"<div class='msg-err'>Fetch failed: {H(ex.Message)}</div>";
+        }
+    }
+    html += "<p class='hint'>VULN: No allowlist on target host — server will fetch any URL including internal-only endpoints. " +
+            "Try <code>http://localhost:7001/internal/secret</code> or <code>http://localhost:7001/elmah.axd</code></p>";
+    return Results.Content(Page("SSRF Demo", html), "text/html");
+});
+
+// ── 17. Account enumeration + predictable password-reset token ─────────────
+app.MapGet("/account/ForgotPassword.aspx", (HttpContext ctx) =>
+{
+    var html =
+        "<h2>Forgot Password</h2>" +
+        "<form method='POST' action='/account/ForgotPassword.aspx'>" +
+        "<div class='field'><label>Username<br><input type='text' name='ctl00$cphMaster$txtUsername' /></label></div>" +
+        "<button class='btn' type='submit'>Send Reset Link</button></form>" +
+        "<p class='hint'>VULN: response differs for valid vs invalid usernames (account enumeration), and the reset token is a predictable base64(username:timestamp).</p>";
+    return Results.Content(Page("Forgot Password", html), "text/html");
+});
+app.MapPost("/account/ForgotPassword.aspx", async (HttpContext ctx) =>
+{
+    var form  = await ctx.Request.ReadFormAsync();
+    var uname = form["ctl00$cphMaster$txtUsername"].ToString().Trim();
+    var host  = ctx.Request.Headers["Host"].ToString();   // used unsanitized below — host header injection
+
+    if (users.ContainsKey(uname))
+    {
+        var ticks = DateTime.UtcNow.Ticks;
+        // VULN: predictable token — base64(username:ticks), no HMAC, no expiry enforcement shown
+        var token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{uname}:{ticks}"));
+        passwordResetTokens[token] = (uname, ticks);
+        // VULN: reset link built from the raw Host header — host header injection / poisoning risk
+        var resetLink = $"https://{host}/account/ResetPassword.aspx?token={Uri.EscapeDataString(token)}";
+        await ctx.Response.WriteAsync(Page("Reset Link Sent",
+            $"<div class='msg-ok'>A password reset link has been sent to the email on file for '{H(uname)}'.</div>" +
+            $"<p class='hint'>(Demo only — normally emailed, shown here for testing) Reset link: <br><code style='word-break:break-all'>{H(resetLink)}</code></p>" +
+            $"<p class='hint'>VULN: Host header was reflected unsanitized into the reset link — try setting <code>Host: evil.com</code> and re-submitting.</p>"));
+    }
+    else
+    {
+        // VULN: different response — allows username enumeration
+        await ctx.Response.WriteAsync(Page("User Not Found",
+            $"<div class='msg-err'>No account found with username '{H(uname)}'.</div>"));
+    }
+});
+app.MapGet("/account/ResetPassword.aspx", (HttpContext ctx) =>
+{
+    var token = ctx.Request.Query["token"].ToString();
+    if (passwordResetTokens.TryGetValue(token, out var info))
+    {
+        var vs = MakeViewState($"Reset|v1|{info.user}");
+        var html =
+            $"<h2>Reset Password for {H(info.user)}</h2>" +
+            "<form method='POST' action='/account/ResetPassword.aspx'>" +
+            $"<input type='hidden' name='__VIEWSTATE' value='{vs}' />" +
+            $"<input type='hidden' name='token' value='{H(token)}' />" +
+            "<div class='field'><label>New Password<br><input type='password' name='ctl00$cphMaster$txtNewPassword' /></label></div>" +
+            "<button class='btn' type='submit'>Reset</button></form>";
+        return Results.Content(Page("Reset Password", html), "text/html");
+    }
+    return Results.Content(Page("Invalid Token", "<div class='msg-err'>Invalid or expired token.</div>"), "text/html");
+});
+app.MapPost("/account/ResetPassword.aspx", async (HttpContext ctx) =>
+{
+    var form  = await ctx.Request.ReadFormAsync();
+    var token = form["token"].ToString();
+    var newPwd = form["ctl00$cphMaster$txtNewPassword"].ToString();
+    if (passwordResetTokens.TryGetValue(token, out var info) && users.ContainsKey(info.user))
+    {
+        users[info.user] = (Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(newPwd))), users[info.user].mfa);
+        passwordResetTokens.Remove(token);
+        await ctx.Response.WriteAsync(Page("Password Reset", $"<div class='msg-ok'>Password for {H(info.user)} has been reset.</div><a href='/account/Login.aspx'>Login</a>"));
+    }
+    else
+    {
+        await ctx.Response.WriteAsync(Page("Error", "<div class='msg-err'>Invalid token.</div>"));
+    }
+});
+
+// ── 18. Weak registration — no password policy, no rate limit ──────────────
+app.MapGet("/account/Register.aspx", () =>
+{
+    var html =
+        "<h2>Create Account</h2>" +
+        "<form method='POST' action='/account/Register.aspx'>" +
+        "<div class='field'><label>Username<br><input type='text' name='ctl00$cphMaster$txtNewUsername' /></label></div>" +
+        "<div class='field'><label>Password<br><input type='password' name='ctl00$cphMaster$txtNewPassword' /></label></div>" +
+        "<button class='btn' type='submit'>Register</button></form>" +
+        "<p class='hint'>VULN: No password complexity requirement (try '1'), no CAPTCHA, no rate limiting — scriptable mass account creation.</p>";
+    return Results.Content(Page("Register", html), "text/html");
+});
+app.MapPost("/account/Register.aspx", async (HttpContext ctx) =>
+{
+    var form  = await ctx.Request.ReadFormAsync();
+    var uname = form["ctl00$cphMaster$txtNewUsername"].ToString().Trim();
+    var pwd   = form["ctl00$cphMaster$txtNewPassword"].ToString();
+
+    if (string.IsNullOrWhiteSpace(uname) || string.IsNullOrWhiteSpace(pwd))
+    {
+        await ctx.Response.WriteAsync(Page("Register", "<div class='msg-err'>Username and password required.</div>"));
+        return;
+    }
+    if (registeredUsers.Contains(uname))
+    {
+        await ctx.Response.WriteAsync(Page("Register", $"<div class='msg-err'>Username '{H(uname)}' already taken.</div>"));
+        return;
+    }
+    registeredUsers.Add(uname);
+    users[uname] = (Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(pwd))), "000000");
+    await ctx.Response.WriteAsync(Page("Registered",
+        $"<div class='msg-ok'>Account '{H(uname)}' created with password length {pwd.Length} (no policy enforced).</div>" +
+        "<a href='/account/Login.aspx'>Login</a>"));
+});
+
+// ── 19. CORS misconfiguration on a JSON API ─────────────────────────────────
+app.MapGet("/api/account-data", (HttpContext ctx) =>
+{
+    var current = ctx.Session.GetString("username") ?? "guest";
+    // VULN: reflects arbitrary Origin + allows credentials — any site can read this
+    // authenticated user's data via a cross-origin fetch(..., {credentials:'include'})
+    var origin = ctx.Request.Headers["Origin"].ToString();
+    ctx.Response.Headers["Access-Control-Allow-Origin"] = string.IsNullOrEmpty(origin) ? "*" : origin;
+    ctx.Response.Headers["Access-Control-Allow-Credentials"] = "true";
+    ctx.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST";
+    userProfiles.TryGetValue(current, out var prof);
+    return Results.Json(new { username = current, email = prof.email, phone = prof.phone, role = prof.role, balance = prof.balance });
+});
+
+// ── 20. HTTP Parameter Pollution on role assignment ─────────────────────────
+app.MapPost("/admin/Panel2.aspx", async (HttpContext ctx) =>
+{
+    // Reads raw body to demonstrate duplicate-key handling: role=user&role=Administrator
+    using var reader = new StreamReader(ctx.Request.Body);
+    var raw = await reader.ReadToEndAsync();
+    var pairs = raw.Split('&').Select(p => p.Split('=')).Where(p => p.Length == 2)
+                   .Select(p => (k: Uri.UnescapeDataString(p[0]).Replace('+',' '), v: Uri.UnescapeDataString(p[1]).Replace('+',' '))).ToList();
+    var roleValues = pairs.Where(p => p.k == "role").Select(p => p.v).ToList();
+    // VULN: takes the LAST value like many parsers do — client can smuggle role=user&role=Administrator
+    // past a naive first-match WAF/validation layer while the app itself uses the last value
+    var effectiveRole = roleValues.LastOrDefault() ?? "user";
+    var html = $"<h2>HTTP Parameter Pollution Demo</h2>" +
+        $"<p>Received {roleValues.Count} 'role' values: {H(string.Join(", ", roleValues))}</p>" +
+        $"<p>Effective role (last value wins): <strong>{H(effectiveRole)}</strong></p>" +
+        (effectiveRole.Equals("Administrator", StringComparison.OrdinalIgnoreCase)
+            ? "<div class='msg-warn'>⚠ Admin access granted via HPP</div>"
+            : "<div class='msg-ok'>Standard user access</div>") +
+        "<p class='hint'>VULN: Try POST body <code>role=user&amp;role=Administrator</code> — a security gateway checking only the first value would miss this.</p>";
+    return Results.Content(Page("HPP Demo", html), "text/html");
+});
+app.MapGet("/admin/Panel2.aspx", () => Results.Content(Page("HPP Demo",
+    "<h2>HTTP Parameter Pollution Demo</h2><p>POST <code>role=user&amp;role=Administrator</code> to <code>/admin/Panel2.aspx</code></p>"), "text/html"));
+
+// ── 21. Insecure cookie flags ─────────────────────────────────────────────────
+app.MapGet("/account/RememberMe.aspx", (HttpContext ctx) =>
+{
+    var current = ctx.Session.GetString("username") ?? "guest";
+    // VULN: no HttpOnly, no Secure, no SameSite — readable by JS, sent over HTTP, sent cross-site
+    ctx.Response.Cookies.Append("RememberMeToken", $"{current}:{Guid.NewGuid():N}", new CookieOptions
+    {
+        HttpOnly = false,
+        Secure = false,
+        SameSite = SameSiteMode.None,
+        Expires = DateTimeOffset.UtcNow.AddDays(30),
+    });
+    return Results.Content(Page("Remember Me",
+        "<div class='msg-ok'>Remember-me cookie set.</div>" +
+        "<p class='hint'>VULN: Cookie set without HttpOnly/Secure/SameSite — check the Set-Cookie header. " +
+        "Contrast with ASP.NET_SessionId, which the framework sets more safely by default.</p>"), "text/html");
+});
+
 // ── Status (updated) ───────────────────────────────────────────────────────
 app.MapGet("/status", () => Results.Json(new
 {
@@ -900,6 +1325,22 @@ app.MapGet("/status", () => Results.Json(new
         "GET/POST /reports/Report.aspx           Multi-UpdatePanel AJAX + XSS in filter",
         "GET      /elmah.axd                     Info disclosure — machineKey partial",
         "GET      /trace.axd                     Trace endpoint — session data",
+        "GET/POST /account/Preferences.aspx      ViewState cleartext isAdmin leak (MAC != encryption)",
+        "GET      /debug/ThrowError.aspx?crash=1  Stack trace + framework version disclosure",
+        "GET      /web.config                    Config file exposure (connection string, machineKey)",
+        "GET      /files/backup.zip, /files/      Exposed backup + directory listing",
+        "GET      /account/SetSession.aspx?sid=   Session fixation",
+        "GET      /product/Details.aspx?sku=      SQL injection (error-based + UNION)",
+        "GET/POST /admin/Ping.aspx                OS command injection",
+        "GET      /files/Download.aspx?file=      Path traversal / LFI",
+        "GET      /tools/FetchUrl.aspx?url=       SSRF (try target /internal/secret)",
+        "GET/POST /account/ForgotPassword.aspx    Account enumeration + predictable reset token + host-header injection",
+        "GET/POST /account/ResetPassword.aspx     (paired with ForgotPassword)",
+        "GET/POST /account/Register.aspx          No password policy, no rate limiting",
+        "GET      /api/account-data               CORS misconfig — reflected Origin + credentials",
+        "GET/POST /admin/Panel2.aspx              HTTP Parameter Pollution (duplicate role=)",
+        "GET      /account/RememberMe.aspx        Insecure cookie flags (no HttpOnly/Secure/SameSite)",
+        "(passive) all responses                  X-AspNet-Version/X-Powered-By/Server disclosed; no CSP/XFO/XCTO/HSTS anywhere",
     },
     test_accounts = new { admin = "Password1!", user = "letmein", victim = "victim123" },
     mfa_codes     = new { admin = "123456", user = "654321", victim = "111111" },

@@ -11,7 +11,22 @@ import ResponsePanel from "./components/ResponsePanel";
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function rebuildBody(params: Param[]): string {
-  return params.map(p => `${encodeURIComponent(p.name)}=${encodeURIComponent(p.value)}`).join("&");
+  return params.filter(p => p.source !== "query")
+    .map(p => `${encodeURIComponent(p.name)}=${encodeURIComponent(p.value)}`).join("&");
+}
+
+function rebuildQueryString(params: Param[]): string {
+  return params.filter(p => p.source === "query")
+    .map(p => `${encodeURIComponent(p.name)}=${encodeURIComponent(p.value)}`).join("&");
+}
+
+/** Reconstruct the full request URL from a parsed request's url_base plus any
+ *  edited query-string params (falls back to the original url if there's no
+ *  url_base, e.g. requests parsed before this field existed). */
+function rebuildUrl(parsed: { url: string; url_base?: string }, params: Param[]): string {
+  if (!parsed.url_base) return parsed.url;
+  const qs = rebuildQueryString(params);
+  return qs ? `${parsed.url_base}?${qs}` : parsed.url_base;
 }
 
 function cookieDictToStr(d: Record<string, string>): string {
@@ -535,25 +550,27 @@ function InterceptTab({ globalCookies, onCookies }: { globalCookies: Record<stri
   const [macResult, setMacResult]   = useState<MacResult | null>(null);
   const [macLoading, setMacLoading] = useState(false);
   const [verifySsl, setVerifySsl]   = useState(false);
+  const [scheme, setScheme]         = useState<"http" | "https">("https");
   const [showAll, setShowAll]       = useState(false);
 
   const parse = useCallback(async () => {
     setParseError("");
     try {
-      const r = await api.parseRequest(rawHttp) as ParsedRequest;
+      const r = await api.parseRequest(rawHttp, scheme) as ParsedRequest;
       setParsed(r); setParams(r.params); setResponse(null);
     } catch (e: unknown) {
       setParseError((e as Error).message);
     }
-  }, [rawHttp]);
+  }, [rawHttp, scheme]);
 
   const send = useCallback(async () => {
     if (!parsed) return;
     setLoading(true);
     try {
+      const url = rebuildUrl(parsed, params);
       const body = rebuildBody(params);
       const cookieStr = cookieDictToStr(globalCookies);
-      const r = await api.replay(parsed.method, parsed.url, parsed.headers, body, verifySsl, cookieStr || undefined) as ReplayResponse;
+      const r = await api.replay(parsed.method, url, parsed.headers, body, verifySsl, cookieStr || undefined) as ReplayResponse;
       setResponse(r);
       if (r.new_cookies) onCookies({ ...globalCookies, ...r.new_cookies });
     } catch (e: unknown) {
@@ -567,9 +584,10 @@ function InterceptTab({ globalCookies, onCookies }: { globalCookies: Record<stri
     if (!parsed) return;
     setMacLoading(true);
     try {
+      const url = rebuildUrl(parsed, params);
       const body = rebuildBody(params);
       const cookieStr = cookieDictToStr(globalCookies);
-      const r = await api.checkMac(parsed.method, parsed.url, parsed.headers, body, verifySsl, cookieStr || undefined) as MacResult;
+      const r = await api.checkMac(parsed.method, url, parsed.headers, body, verifySsl, cookieStr || undefined) as MacResult;
       setMacResult(r);
     } catch (e: unknown) {
       alert((e as Error).message);
@@ -590,6 +608,15 @@ function InterceptTab({ globalCookies, onCookies }: { globalCookies: Record<stri
           <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#30363d] bg-[#161b22] flex-shrink-0">
             <span className="text-[#8b949e] text-xs font-semibold uppercase tracking-wider">Raw HTTP Request</span>
             <div className="flex items-center gap-2">
+              <select
+                value={scheme}
+                onChange={e => setScheme(e.target.value as "http" | "https")}
+                title="Scheme to use when sending this request — raw HTTP requests don't carry one. Most production ASP.NET targets are HTTPS; pick HTTP for legacy/intranet plaintext apps."
+                className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[10px] text-[#8b949e] cursor-pointer"
+              >
+                <option value="https">HTTPS</option>
+                <option value="http">HTTP</option>
+              </select>
               <label className="flex items-center gap-1 text-xs text-[#8b949e] cursor-pointer">
                 <input type="checkbox" checked={verifySsl} onChange={e => setVerifySsl(e.target.checked)} /> SSL
               </label>

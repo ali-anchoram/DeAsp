@@ -14,8 +14,8 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 }
 
 export const api = {
-  parseRequest: (raw_request: string) =>
-    post("/parse-request", { raw_request }),
+  parseRequest: (raw_request: string, force_scheme?: "http" | "https") =>
+    post("/parse-request", { raw_request, force_scheme }),
 
   fetchUrl: (url: string, verify_ssl: boolean, cookies?: string) =>
     post("/fetch-url", { url, verify_ssl, cookies }),
