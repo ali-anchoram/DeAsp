@@ -4,13 +4,13 @@ from pydantic import BaseModel
 import httpx
 import base64
 import struct
-from urllib.parse import unquote_plus, urlencode, urlparse, urljoin, quote_plus
+from urllib.parse import unquote_plus, urljoin, quote_plus
 import re
 from typing import Optional, Dict, List, Any
 import json
 from bs4 import BeautifulSoup
 
-app = FastAPI(title="DeAsp - ASP.NET Pentesting Tool")
+app = FastAPI(title="DeAsp")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,14 +20,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── ASP.NET field classification ─────────────────────────────────────────────
+# ── ASP.NET field classification ──────────────────────────────────────────────
 
 ASPNET_SYSTEM = {
     "__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION",
     "__LASTFOCUS", "__SCROLLPOSITIONX", "__SCROLLPOSITIONY",
     "__PREVIOUSPAGE", "__VIEWSTATEFIELDCOUNT", "__VIEWSTATEENCRYPTED",
 }
-
 ASPNET_EVENT = {"__EVENTTARGET", "__EVENTARGUMENT"}
 ASPNET_AJAX  = {"__ASYNCPOST"}
 
@@ -51,12 +50,10 @@ def classify_param(name: str) -> str:
 
 class _LOS:
     def __init__(self, data: bytes):
-        self.d = data
-        self.p = 0
+        self.d = data; self.p = 0
 
     def _rb(self) -> int:
-        if self.p >= len(self.d):
-            raise ValueError("Unexpected EOF")
+        if self.p >= len(self.d): raise ValueError("EOF")
         b = self.d[self.p]; self.p += 1; return b
 
     def _ri32(self) -> int:
@@ -74,19 +71,17 @@ class _LOS:
     def _r7(self) -> int:
         res = shift = 0
         while True:
-            b = self._rb()
-            res |= (b & 0x7F) << shift
+            b = self._rb(); res |= (b & 0x7F) << shift
             if not (b & 0x80): return res
             shift += 7
             if shift >= 35: raise ValueError("Bad 7-bit int")
 
     def _rs(self) -> str:
         n = self._r7()
-        s = self.d[self.p:self.p + n].decode("utf-8", errors="replace"); self.p += n; return s
+        s = self.d[self.p:self.p+n].decode("utf-8", errors="replace"); self.p += n; return s
 
     def val(self, depth: int = 0) -> Any:
-        if depth > 60:
-            return {"_trunc": True}
+        if depth > 60: return {"_trunc": True}
         t = self._rb()
         if t == 0x00: return None
         if t == 0x01: return 0
@@ -101,11 +96,9 @@ class _LOS:
         if t == 0x35: return self._rf()
         if t == 0x36: return self._rd()
         if t == 0x14:
-            a = self.val(depth+1); b = self.val(depth+1)
-            return {"_T": "Pair", "first": a, "second": b}
+            return {"_T": "Pair", "first": self.val(depth+1), "second": self.val(depth+1)}
         if t == 0x15:
-            a = self.val(depth+1); b = self.val(depth+1); c = self.val(depth+1)
-            return {"_T": "Triplet", "first": a, "second": b, "third": c}
+            return {"_T": "Triplet", "first": self.val(depth+1), "second": self.val(depth+1), "third": self.val(depth+1)}
         if t == 0x16:
             n = self._r7()
             return {"_T": "ArrayList", "items": [self.val(depth+1) for _ in range(n)]}
@@ -116,13 +109,10 @@ class _LOS:
             n = self._r7()
             return {"_T": "IntArray", "items": [self._ri32() for _ in range(n)]}
         if t in (0x0F, 0x10):
-            label = "Hashtable" if t == 0x0F else "SortedList"
-            n = self._r7()
-            entries = {}
+            n = self._r7(); entries = {}
             for _ in range(n):
-                k = self.val(depth+1); v = self.val(depth+1)
-                entries[str(k)] = v
-            return {"_T": label, "entries": entries}
+                k = self.val(depth+1); v = self.val(depth+1); entries[str(k)] = v
+            return {"_T": "Hashtable" if t == 0x0F else "SortedList", "entries": entries}
         if t == 0x28:
             v = self._ri32()
             return {"_T": "Color", "hex": f"#{v & 0xFFFFFF:06X}", "alpha": (v >> 24) & 0xFF}
@@ -133,8 +123,7 @@ class _LOS:
         if t == 0x1F: return "0"
         if t == 0x22:
             ti = self._r7(); n = self._r7()
-            return {"_T": "TypedArray", "typeIdx": ti,
-                    "items": [self.val(depth+1) for _ in range(n)]}
+            return {"_T": "TypedArray", "typeIdx": ti, "items": [self.val(depth+1) for _ in range(n)]}
         return {"_T": f"unk_0x{t:02x}", "_hex": self.d[self.p:self.p+32].hex()}
 
 
@@ -146,14 +135,9 @@ def decode_viewstate(vs: str) -> Dict:
         return {"error": f"Invalid base64: {e}", "raw": vs[:80]}
 
     if len(data) < 2 or data[0] != 0xFF or data[1] != 0x01:
-        return {
-            "error": f"Bad magic: {data[:2].hex() if data else 'empty'}",
-            "decoded_bytes": len(data),
-            "hex_preview": data[:32].hex(),
-        }
+        return {"error": f"Bad magic: {data[:2].hex() if data else 'empty'}", "decoded_bytes": len(data), "hex_preview": data[:32].hex()}
 
-    los = _LOS(data)
-    los.p = 2
+    los = _LOS(data); los.p = 2
     try:
         value = los.val()
         mac = data[los.p:]
@@ -162,23 +146,15 @@ def decode_viewstate(vs: str) -> Dict:
                else "AES/HMAC(16B)" if mac_len == 16
                else f"unknown ({mac_len}B)" if mac_len else None)
         return {
-            "value": value,
-            "mac_present": mac_len > 0,
+            "value": value, "mac_present": mac_len > 0,
             "mac_bytes": mac.hex() if mac else None,
-            "mac_length": mac_len,
-            "mac_algorithm": alg,
-            "total_bytes": len(data),
-            "serialized_bytes": los.p,
+            "mac_length": mac_len, "mac_algorithm": alg,
+            "total_bytes": len(data), "serialized_bytes": los.p,
             "base64_length": len(vs),
             "hex_preview": data[:32].hex() + ("…" if len(data) > 32 else ""),
         }
     except Exception as e:
-        return {
-            "error": str(e),
-            "partial": True,
-            "hex_preview": data[:64].hex(),
-            "decoded_bytes": len(data),
-        }
+        return {"error": str(e), "partial": True, "hex_preview": data[:64].hex(), "decoded_bytes": len(data)}
 
 
 # ── HTTP parser ───────────────────────────────────────────────────────────────
@@ -200,15 +176,13 @@ def _build_params(body: str, content_type: str) -> List[Dict]:
         return params
 
     for pair in body.split("&"):
-        if not pair:
-            continue
+        if not pair: continue
         if "=" in pair:
             k, _, v = pair.partition("=")
             dk, dv = unquote_plus(k), unquote_plus(v)
             ptype = classify_param(dk)
             p: Dict = {
-                "name": dk, "raw_name": k,
-                "value": dv, "raw_value": v,
+                "name": dk, "raw_name": k, "value": dv, "raw_value": v,
                 "type": ptype, "editable": ptype == "user",
             }
             if dk in ("__VIEWSTATE", "__EVENTVALIDATION"):
@@ -216,27 +190,18 @@ def _build_params(body: str, content_type: str) -> List[Dict]:
             params.append(p)
         else:
             dk = unquote_plus(pair)
-            params.append({
-                "name": dk, "raw_name": pair,
-                "value": "", "raw_value": "",
-                "type": classify_param(dk), "editable": True,
-            })
+            params.append({"name": dk, "raw_name": pair, "value": "", "raw_value": "",
+                           "type": classify_param(dk), "editable": True})
     return params
 
 
 def parse_raw_http(raw: str) -> Dict:
     lines = raw.replace("\r\n", "\n").split("\n")
-    if not lines:
-        raise ValueError("Empty request")
-
+    if not lines: raise ValueError("Empty request")
     m = re.match(r"^(\w+)\s+(\S+)\s+(HTTP/[\d.]+)\s*$", lines[0].strip(), re.I)
-    if not m:
-        raise ValueError(f"Bad request line: {lines[0]!r}")
+    if not m: raise ValueError(f"Bad request line: {lines[0]!r}")
 
-    method = m.group(1).upper()
-    path   = m.group(2)
-    ver    = m.group(3)
-
+    method, path, ver = m.group(1).upper(), m.group(2), m.group(3)
     headers: Dict[str, str] = {}
     i = 1
     while i < len(lines) and lines[i].strip():
@@ -244,21 +209,16 @@ def parse_raw_http(raw: str) -> Dict:
             k, _, v = lines[i].partition(":")
             headers[k.strip()] = v.strip()
         i += 1
-
     body = "\n".join(lines[i + 1:]).strip() if i + 1 < len(lines) else ""
     ct   = headers.get("Content-Type", "")
     host = headers.get("Host", "")
-
-    scheme = "https" if headers.get("X-Forwarded-Proto", "https") == "https" else "http"
-    url = f"{scheme}://{host}{path}"
-
+    url  = f"https://{host}{path}"
     params = _build_params(body, ct)
 
     return {
         "method": method, "path": path, "url": url,
-        "http_version": ver, "headers": headers,
-        "body": body, "params": params,
-        "content_type": ct,
+        "http_version": ver, "headers": headers, "body": body,
+        "params": params, "content_type": ct,
         "is_ajax": bool(headers.get("X-Requested-With")) or "__ASYNCPOST" in body,
         "is_aspnet": any(p["name"].startswith("__") for p in params),
     }
@@ -278,12 +238,12 @@ def parse_ajax_response(body: str) -> List[Dict]:
             break
         p2 = body.find("|", p1 + 1)
         if p2 == -1: break
-        ptype = body[p1 + 1:p2]
+        ptype = body[p1+1:p2]
         p3 = body.find("|", p2 + 1)
         if p3 == -1: break
-        pid = body[p2 + 1:p3]
+        pid = body[p2+1:p3]
         cs = p3 + 1
-        content = body[cs:cs + length]
+        content = body[cs:cs+length]
         part: Dict = {"type": ptype, "id": pid, "content": content, "length": length}
         if ptype == "hiddenField" and pid == "__VIEWSTATE":
             part["viewstate_decoded"] = decode_viewstate(content)
@@ -292,9 +252,33 @@ def parse_ajax_response(body: str) -> List[Dict]:
             part["is_error"] = True
         elif ptype == "pageRedirect":
             part["redirect_url"] = content
+        elif ptype == "updatePanel":
+            # Extract visible text from the HTML for summary
+            try:
+                soup = BeautifulSoup(content, "lxml")
+                part["text_preview"] = soup.get_text(separator=" ", strip=True)[:300]
+            except Exception:
+                pass
         parts.append(part)
         i = cs + length + 1
     return parts
+
+
+# ── Cookie jar (in-memory, per-session via header) ────────────────────────────
+# We keep it simple: client sends cookies string, we use it.
+
+def _cookie_dict(cookie_str: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for c in (cookie_str or "").split(";"):
+        c = c.strip()
+        if "=" in c:
+            k, _, v = c.partition("=")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _cookie_str(d: Dict[str, str]) -> str:
+    return "; ".join(f"{k}={v}" for k, v in d.items())
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -307,12 +291,20 @@ class FetchUrl(BaseModel):
     verify_ssl: bool = False
     cookies: Optional[str] = None
 
+class LoginFlow(BaseModel):
+    login_url: str
+    method: str = "POST"
+    credentials: Dict[str, str]   # {"username_field": "val", "password_field": "val"}
+    verify_ssl: bool = False
+    extra_cookies: Optional[str] = None
+
 class Replay(BaseModel):
     method: str
     url: str
     headers: Dict[str, str]
     body: str
     verify_ssl: bool = False
+    extra_cookies: Optional[str] = None
 
 class DecodeVS(BaseModel):
     viewstate: str
@@ -324,6 +316,7 @@ class CheckMac(BaseModel):
     body: str
     viewstate_param: str = "__VIEWSTATE"
     verify_ssl: bool = False
+    extra_cookies: Optional[str] = None
 
 class ParseAjax(BaseModel):
     body: str
@@ -346,53 +339,136 @@ async def api_parse_request(inp: RawReq):
 
 @app.post("/api/fetch-url")
 async def api_fetch_url(inp: FetchUrl):
+    """Fetch a URL, auto-fill ViewState/hidden fields, return only user params."""
     try:
+        cookies = _cookie_dict(inp.cookies or "")
         hdrs = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-AU,en;q=0.5",
         }
-        cookies: Dict[str, str] = {}
-        if inp.cookies:
-            for c in inp.cookies.split(";"):
-                c = c.strip()
-                if "=" in c:
-                    ck, _, cv = c.partition("=")
-                    cookies[ck.strip()] = cv.strip()
+        async with httpx.AsyncClient(verify=inp.verify_ssl, follow_redirects=True, timeout=30,
+                                     cookies=cookies) as client:
+            r = await client.get(inp.url, headers=hdrs)
 
-        async with httpx.AsyncClient(verify=inp.verify_ssl, follow_redirects=True, timeout=30) as client:
-            r = await client.get(inp.url, headers=hdrs, cookies=cookies)
+        # Merge any new cookies from response
+        all_cookies = {**cookies, **dict(r.cookies)}
 
         soup = BeautifulSoup(r.text, "lxml")
         forms = []
         for form in soup.find_all("form"):
-            action = form.get("action", inp.url) or inp.url
+            action = form.get("action") or inp.url
             if not action.startswith("http"):
-                action = urljoin(inp.url, action)
+                action = urljoin(str(r.url), action)
             method = (form.get("method") or "POST").upper()
-            params = []
+            all_params = []
+            user_params = []
             for el in form.find_all(["input", "select", "textarea"]):
                 name = el.get("name", "")
-                if not name:
-                    continue
+                if not name: continue
                 value = el.get("value", "")
                 itype = (el.get("type") or "text").lower()
                 ptype = classify_param(name)
                 p: Dict = {
                     "name": name, "raw_name": name,
                     "value": value, "raw_value": value,
-                    "type": ptype,
-                    "editable": ptype == "user" or itype not in ("hidden",),
+                    "type": ptype, "editable": ptype == "user",
                     "input_type": itype,
                 }
                 if name == "__VIEWSTATE" and value:
                     p["viewstate"] = decode_viewstate(value)
-                params.append(p)
-            forms.append({"action": action, "method": method, "params": params})
+                all_params.append(p)
+                if ptype == "user":
+                    user_params.append(p)
+
+            forms.append({
+                "action": action, "method": method,
+                "all_params": all_params,
+                "user_params": user_params,
+                "param_counts": {
+                    "user": len([x for x in all_params if x["type"] == "user"]),
+                    "event": len([x for x in all_params if x["type"] == "event"]),
+                    "ajax": len([x for x in all_params if x["type"] == "ajax"]),
+                    "system": len([x for x in all_params if x["type"] == "system"]),
+                },
+            })
 
         return {
             "url": str(r.url), "status": r.status_code,
-            "forms": forms, "cookies": dict(r.cookies),
-            "aspnet_session": r.cookies.get("ASP.NET_SessionId"),
+            "forms": forms,
+            "cookies": all_cookies,
+            "aspnet_session": all_cookies.get("ASP.NET_SessionId"),
+            "set_cookie_header": r.headers.get("set-cookie", ""),
+        }
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Request failed: {e}")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/login")
+async def api_login(inp: LoginFlow):
+    """
+    Two-step login: GET the login page (grab ViewState), then POST credentials.
+    Returns the resulting cookies so the client can store them.
+    """
+    try:
+        init_cookies = _cookie_dict(inp.extra_cookies or "")
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        async with httpx.AsyncClient(verify=inp.verify_ssl, follow_redirects=True,
+                                     timeout=30, cookies=init_cookies) as client:
+            # Step 1 — GET the login page to grab ViewState etc.
+            get_r = await client.get(inp.login_url, headers=hdrs)
+            soup = BeautifulSoup(get_r.text, "lxml")
+
+            # Build form body
+            form_data: Dict[str, str] = {}
+            form = soup.find("form")
+            if form:
+                for el in form.find_all("input"):
+                    n = el.get("name", "")
+                    v = el.get("value", "")
+                    if n: form_data[n] = v
+
+            # Override with provided credentials
+            form_data.update(inp.credentials)
+
+            # Determine submit URL
+            action = (form.get("action") if form else None) or inp.login_url
+            if not action.startswith("http"):
+                action = urljoin(str(get_r.url), action)
+
+            post_hdrs = {**hdrs, "Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": str(get_r.url)}
+
+            # Step 2 — POST the login
+            post_r = await client.post(
+                action, headers=post_hdrs,
+                data=form_data,
+            )
+
+        # Collect all cookies across redirects
+        all_cookies = {**init_cookies, **dict(client.cookies)}
+        session_id = all_cookies.get("ASP.NET_SessionId")
+
+        # Detect login success heuristically
+        post_body = post_r.text.lower()
+        hints_fail = any(x in post_body for x in ("invalid password", "incorrect", "failed", "error", "login"))
+        hints_ok   = not hints_fail or post_r.status_code in (302, 200) and bool(session_id)
+
+        return {
+            "login_url": inp.login_url,
+            "submit_url": action,
+            "response_status": post_r.status_code,
+            "final_url": str(post_r.url),
+            "cookies": all_cookies,
+            "aspnet_session": session_id,
+            "likely_success": hints_ok,
+            "set_cookie_headers": dict(post_r.headers.multi_items()),
         }
     except httpx.RequestError as e:
         raise HTTPException(502, f"Request failed: {e}")
@@ -403,11 +479,17 @@ async def api_fetch_url(inp: FetchUrl):
 @app.post("/api/replay")
 async def api_replay(inp: Replay):
     try:
+        extra_cookies = _cookie_dict(inp.extra_cookies or "")
+        existing = _cookie_dict(inp.headers.get("Cookie", ""))
+        merged = {**existing, **extra_cookies}
+
         hdrs = {k: v for k, v in inp.headers.items()
-                if k.lower() not in ("content-length", "connection")}
+                if k.lower() not in ("content-length", "connection", "cookie")}
+        if merged:
+            hdrs["Cookie"] = _cookie_str(merged)
+
         async with httpx.AsyncClient(verify=inp.verify_ssl, follow_redirects=False, timeout=30) as client:
-            r = await client.request(inp.method, inp.url, headers=hdrs,
-                                     content=inp.body.encode())
+            r = await client.request(inp.method, inp.url, headers=hdrs, content=inp.body.encode())
 
         body_text = r.text
         ajax_parts: List[Dict] = []
@@ -427,6 +509,7 @@ async def api_replay(inp: Replay):
             "aspnet_error": r.status_code == 500 or "Runtime Error" in body_text,
             "viewstate_error": "viewstate" in body_text.lower() and
                                any(x in body_text.lower() for x in ("invalid", "tamper", "mac")),
+            "new_cookies": dict(r.cookies),
         }
     except httpx.RequestError as e:
         raise HTTPException(502, f"Request failed: {e}")
@@ -435,7 +518,7 @@ async def api_replay(inp: Replay):
 
 
 @app.post("/api/decode-viewstate")
-async def api_decode_viewstate(inp: DecodeVS):
+async def api_decode_vs(inp: DecodeVS):
     return decode_viewstate(inp.viewstate)
 
 
@@ -459,9 +542,8 @@ async def api_check_mac(inp: CheckMac):
     vs_info = decode_viewstate(vs_val)
     if not vs_info.get("mac_present"):
         return {
-            "mac_present_in_viewstate": False,
-            "test_result": "no_mac",
-            "message": "No MAC bytes detected — may already be MAC-less or unexpected format.",
+            "mac_present_in_viewstate": False, "test_result": "no_mac",
+            "message": "No MAC bytes detected — already MAC-less or unexpected format.",
         }
 
     mac_len = vs_info["mac_length"]
@@ -481,29 +563,29 @@ async def api_check_mac(inp: CheckMac):
             new_pairs.append(pair)
     new_body = "&".join(new_pairs)
 
-    hdrs = {k: v for k, v in inp.headers.items()
-            if k.lower() not in ("content-length", "connection")}
+    extra_cookies = _cookie_dict(inp.extra_cookies or "")
+    existing = _cookie_dict(inp.headers.get("Cookie", ""))
+    merged = {**existing, **extra_cookies}
+    hdrs = {k: v for k, v in inp.headers.items() if k.lower() not in ("content-length", "connection", "cookie")}
+    if merged:
+        hdrs["Cookie"] = _cookie_str(merged)
+
     try:
         async with httpx.AsyncClient(verify=inp.verify_ssl, follow_redirects=False, timeout=30) as client:
-            r = await client.request(inp.method, inp.url, headers=hdrs,
-                                     content=new_body.encode())
+            r = await client.request(inp.method, inp.url, headers=hdrs, content=new_body.encode())
         bl = r.text.lower()
         vs_err = any(x in bl for x in ("viewstate", "mac", "tamper", "invalid state", "state information"))
         if r.status_code == 500 or vs_err:
             result = "mac_enabled"; vuln = False
-            msg = "MAC validation is ENABLED — server rejected the tampered ViewState."
+            msg = "MAC validation ENABLED — server rejected the tampered ViewState."
         else:
             result = "mac_disabled"; vuln = True
-            msg = "⚠ MAC validation appears DISABLED — server accepted the tampered ViewState!"
+            msg = "⚠ MAC validation DISABLED — server accepted tampered ViewState!"
         return {
             "mac_present_in_viewstate": True,
-            "mac_length": mac_len,
-            "mac_algorithm": vs_info.get("mac_algorithm"),
-            "test_result": result,
-            "vulnerable": vuln,
-            "message": msg,
-            "response_status": r.status_code,
-            "stripped_viewstate": stripped_b64,
+            "mac_length": mac_len, "mac_algorithm": vs_info.get("mac_algorithm"),
+            "test_result": result, "vulnerable": vuln, "message": msg,
+            "response_status": r.status_code, "stripped_viewstate": stripped_b64,
         }
     except httpx.RequestError as e:
         raise HTTPException(502, f"Request failed: {e}")

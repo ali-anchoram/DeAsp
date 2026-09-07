@@ -20,14 +20,17 @@ export const api = {
   fetchUrl: (url: string, verify_ssl: boolean, cookies?: string) =>
     post("/fetch-url", { url, verify_ssl, cookies }),
 
-  replay: (method: string, url: string, headers: Record<string, string>, body: string, verify_ssl: boolean) =>
-    post("/replay", { method, url, headers, body, verify_ssl }),
+  login: (login_url: string, credentials: Record<string, string>, verify_ssl: boolean, extra_cookies?: string) =>
+    post("/login", { login_url, credentials, verify_ssl, extra_cookies }),
+
+  replay: (method: string, url: string, headers: Record<string, string>, body: string, verify_ssl: boolean, extra_cookies?: string) =>
+    post("/replay", { method, url, headers, body, verify_ssl, extra_cookies }),
 
   decodeViewstate: (viewstate: string) =>
     post("/decode-viewstate", { viewstate }),
 
-  checkMac: (method: string, url: string, headers: Record<string, string>, body: string, verify_ssl: boolean) =>
-    post("/check-mac", { method, url, headers, body, verify_ssl }),
+  checkMac: (method: string, url: string, headers: Record<string, string>, body: string, verify_ssl: boolean, extra_cookies?: string) =>
+    post("/check-mac", { method, url, headers, body, verify_ssl, extra_cookies }),
 
   parseAjax: (body: string) =>
     post("/parse-ajax-response", { body }),

@@ -1,5 +1,5 @@
 export type ParamType = "system" | "event" | "ajax" | "user";
-export type TabId = "intercept" | "fetch" | "viewstate";
+export type TabId = "intercept" | "fetch" | "viewstate" | "login";
 
 export interface ViewStateInfo {
   value?: unknown;
@@ -49,6 +49,7 @@ export interface AjaxPart {
   viewstate_decoded?: ViewStateInfo;
   is_error?: boolean;
   redirect_url?: string;
+  text_preview?: string;
 }
 
 export interface ReplayResponse {
@@ -60,6 +61,7 @@ export interface ReplayResponse {
   content_type: string;
   aspnet_error: boolean;
   viewstate_error: boolean;
+  new_cookies?: Record<string, string>;
 }
 
 export interface MacResult {
@@ -76,7 +78,9 @@ export interface MacResult {
 export interface FetchedForm {
   action: string;
   method: string;
-  params: Param[];
+  all_params: Param[];
+  user_params: Param[];
+  param_counts: { user: number; event: number; ajax: number; system: number };
 }
 
 export interface FetchResult {
