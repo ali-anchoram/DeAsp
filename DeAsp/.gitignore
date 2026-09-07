@@ -11,3 +11,6 @@ frontend/dist/
 # Misc
 .DS_Store
 *.env
+testapp/AspNetTarget/publish/
+testapp/AspNetTarget/bin/
+testapp/AspNetTarget/obj/
