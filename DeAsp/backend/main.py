@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import httpx
 import base64
 import struct
-from urllib.parse import unquote_plus, urljoin, quote_plus
+from urllib.parse import unquote_plus, unquote, urljoin, quote_plus
 import re
 from typing import Optional, Dict, List, Any
 import json
@@ -127,10 +127,19 @@ class _LOS:
         return {"_T": f"unk_0x{t:02x}", "_hex": self.d[self.p:self.p+32].hex()}
 
 
+def _b64pad(s: str) -> str:
+    """Pad a base64 string to a valid length without corrupting already-padded input."""
+    return s + "=" * (-len(s) % 4)
+
+
 def decode_viewstate(vs: str) -> Dict:
-    vs = unquote_plus(vs.strip())
+    # NOTE: caller must pass already-decoded base64 (raw '+' is a valid base64
+    # character and must NOT be run through unquote_plus here, or it gets
+    # corrupted into a space — see api_decode_viewstate for the one safe place
+    # to unescape %XX sequences from copy-pasted URL-encoded input).
+    vs = vs.strip()
     try:
-        data = base64.b64decode(vs + "==")
+        data = base64.b64decode(_b64pad(vs))
     except Exception as e:
         return {"error": f"Invalid base64: {e}", "raw": vs[:80]}
 
@@ -519,7 +528,10 @@ async def api_replay(inp: Replay):
 
 @app.post("/api/decode-viewstate")
 async def api_decode_vs(inp: DecodeVS):
-    return decode_viewstate(inp.viewstate)
+    # unquote (not unquote_plus) only touches %XX escapes and leaves a literal
+    # '+' alone, so it's safe whether the user pastes raw base64 or a
+    # URL-encoded value copied straight out of a request body.
+    return decode_viewstate(unquote(inp.viewstate.strip()))
 
 
 @app.post("/api/check-mac")
@@ -535,7 +547,7 @@ async def api_check_mac(inp: CheckMac):
         raise HTTPException(400, f"No {inp.viewstate_param} in body")
 
     try:
-        vs_bytes = base64.b64decode(vs_val + "==")
+        vs_bytes = base64.b64decode(_b64pad(vs_val))
     except Exception:
         raise HTTPException(400, "Invalid ViewState base64")
 
