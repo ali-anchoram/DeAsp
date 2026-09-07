@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: 'Fira Code', Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#root { height: 100vh; display: flex; flex-direction: column; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #161b22; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+textarea, input[type="text"], input[type="url"] {
+  font-family: 'Fira Code', Consolas, monospace;
+  font-size: 13px;
+}
+
+.glow-usr { box-shadow: 0 0 0 1px #56d364, 0 0 8px rgba(86,211,100,0.15); }
+.glow-warn { box-shadow: 0 0 0 1px #f0883e, 0 0 8px rgba(240,136,62,0.2); }

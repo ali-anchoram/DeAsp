@@ -1,0 +1,34 @@
+const BASE = "/api";
+
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail ?? r.statusText);
+  }
+  return r.json();
+}
+
+export const api = {
+  parseRequest: (raw_request: string) =>
+    post("/parse-request", { raw_request }),
+
+  fetchUrl: (url: string, verify_ssl: boolean, cookies?: string) =>
+    post("/fetch-url", { url, verify_ssl, cookies }),
+
+  replay: (method: string, url: string, headers: Record<string, string>, body: string, verify_ssl: boolean) =>
+    post("/replay", { method, url, headers, body, verify_ssl }),
+
+  decodeViewstate: (viewstate: string) =>
+    post("/decode-viewstate", { viewstate }),
+
+  checkMac: (method: string, url: string, headers: Record<string, string>, body: string, verify_ssl: boolean) =>
+    post("/check-mac", { method, url, headers, body, verify_ssl }),
+
+  parseAjax: (body: string) =>
+    post("/parse-ajax-response", { body }),
+};
