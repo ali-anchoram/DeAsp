@@ -203,26 +203,90 @@ function MacModal({ result, onClose }: { result: MacResult; onClose: () => void 
 
 // ── Login Tab ─────────────────────────────────────────────────────────────────
 
+// Field-name substrings that hint at username vs. other text inputs, in
+// priority order — checked case-insensitively against name/id.
+const USERNAME_HINTS = ["username", "user", "email", "login", "signin", "logon", "userid", "uid"];
+const CUSTOM_FIELD = "__custom__";
+
+function scoreUsernameCandidate(name: string): number {
+  const lc = name.toLowerCase();
+  const idx = USERNAME_HINTS.findIndex(h => lc.includes(h));
+  return idx === -1 ? USERNAME_HINTS.length : idx; // lower = better match
+}
+
 function LoginTab({ cookies, onCookies }: { cookies: Record<string, string>; onCookies: (c: Record<string, string>) => void }) {
   const [loginUrl, setLoginUrl]     = useState("");
-  const [userField, setUserField]   = useState("ctl00$cphMaster$txtUsername");
-  const [passField, setPassField]   = useState("ctl00$cphMaster$txtPassword");
+  const [userField, setUserField]   = useState("");
+  const [passField, setPassField]   = useState("");
+  const [userFieldCustom, setUserFieldCustom] = useState("");
+  const [passFieldCustom, setPassFieldCustom] = useState("");
   const [username, setUsername]     = useState("");
   const [password, setPassword]     = useState("");
   const [verifySsl, setVerifySsl]   = useState(false);
   const [loading, setLoading]       = useState(false);
+  const [detecting, setDetecting]   = useState(false);
+  const [detectError, setDetectError] = useState("");
+  const [fields, setFields]         = useState<Param[] | null>(null);
   const [result, setResult]         = useState<null | {
     aspnet_session?: string; likely_success: boolean; final_url: string;
     response_status: number; cookies: Record<string, string>;
   }>(null);
   const [error, setError]           = useState("");
 
+  const userCandidates = (fields ?? []).filter(f => ["text", "email", "tel", ""].includes(f.input_type ?? ""));
+  const passCandidates = (fields ?? []).filter(f => f.input_type === "password");
+
+  const detectFields = async () => {
+    if (!loginUrl) return;
+    setDetectError(""); setDetecting(true);
+    try {
+      const r = await api.fetchUrl(loginUrl, verifySsl) as FetchResult;
+      // Prefer the form that actually has a password field — that's the login form.
+      const withPassword = r.forms.find(f => f.all_params.some(p => p.input_type === "password"));
+      const form = withPassword ?? r.forms[0];
+      if (!form) {
+        setDetectError("No form found on that page — check the URL, or enter field names manually below.");
+        setFields([]);
+        return;
+      }
+      setFields(form.all_params);
+
+      const pwCandidates = form.all_params.filter(p => p.input_type === "password");
+      const userCands = form.all_params.filter(p => ["text", "email", "tel", ""].includes(p.input_type ?? ""));
+
+      if (pwCandidates.length > 0) {
+        setPassField(pwCandidates[0].name);
+      } else {
+        setPassField(CUSTOM_FIELD);
+      }
+
+      if (userCands.length > 0) {
+        const best = [...userCands].sort((a, b) => scoreUsernameCandidate(a.name) - scoreUsernameCandidate(b.name))[0];
+        setUserField(best.name);
+      } else {
+        setUserField(CUSTOM_FIELD);
+      }
+
+      if (pwCandidates.length === 0 && userCands.length === 0) {
+        setDetectError("Found a form but no obvious username/password inputs — pick fields manually below.");
+      }
+    } catch (e: unknown) {
+      setDetectError((e as Error).message);
+      setFields([]);
+    } finally {
+      setDetecting(false);
+    }
+  };
+
+  const effectiveUserField = userField === CUSTOM_FIELD ? userFieldCustom : userField;
+  const effectivePassField = passField === CUSTOM_FIELD ? passFieldCustom : passField;
+
   const login = async () => {
     setError(""); setLoading(true);
     try {
       const creds: Record<string, string> = {
-        [userField]: username,
-        [passField]: password,
+        [effectiveUserField]: username,
+        [effectivePassField]: password,
       };
       const r = await (api as unknown as { login: (a: string, c: Record<string, string>, v: boolean, ec: string) => Promise<unknown> }).login(
         loginUrl, creds, verifySsl, cookieDictToStr(cookies)
@@ -246,21 +310,70 @@ function LoginTab({ cookies, onCookies }: { cookies: Record<string, string>; onC
         <div className="space-y-3">
           <div>
             <label className="text-xs text-[#8b949e] block mb-1">Login page URL</label>
-            <input type="url" className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-sm outline-none focus:border-[#58a6ff]"
-              placeholder="https://target.example/account/Login.aspx"
-              value={loginUrl} onChange={e => setLoginUrl(e.target.value)} />
+            <div className="flex gap-2">
+              <input type="url" className="flex-1 bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-sm outline-none focus:border-[#58a6ff]"
+                placeholder="https://target.example/account/Login.aspx"
+                value={loginUrl}
+                onChange={e => { setLoginUrl(e.target.value); setFields(null); }}
+                onBlur={detectFields}
+                onKeyDown={e => { if (e.key === "Enter") detectFields(); }} />
+              <button onClick={detectFields} disabled={detecting || !loginUrl}
+                className="px-3 py-2 rounded text-xs font-bold bg-[#1a365d] text-[#58a6ff] border border-[#58a6ff] hover:bg-[#58a6ff] hover:text-black disabled:opacity-50 transition flex-shrink-0">
+                {detecting ? "Detecting…" : "🔍 Detect Fields"}
+              </button>
+            </div>
+            {detectError && <div className="text-[#f0883e] text-xs mt-1">{detectError}</div>}
+            {fields && fields.length > 0 && !detectError && (
+              <div className="text-[#56d364] text-xs mt-1">
+                ✓ Found {fields.length} field{fields.length !== 1 ? "s" : ""} on the form — username/password guessed below, override if wrong.
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="text-xs text-[#8b949e] block mb-1">Username field name</label>
-              <input type="text" className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]"
-                value={userField} onChange={e => setUserField(e.target.value)} />
+              <label className="text-xs text-[#8b949e] block mb-1">Username field</label>
+              {userCandidates.length > 0 ? (
+                <select value={userField} onChange={e => setUserField(e.target.value)}
+                  className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]">
+                  {userCandidates.map(f => (
+                    <option key={f.name} value={f.name}>{f.name} ({f.input_type || "text"})</option>
+                  ))}
+                  <option value={CUSTOM_FIELD}>Other (type manually)…</option>
+                </select>
+              ) : (
+                <input type="text" className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]"
+                  placeholder="ctl00$cphMaster$txtUsername"
+                  value={userField === CUSTOM_FIELD ? userFieldCustom : userField}
+                  onChange={e => { setUserField(CUSTOM_FIELD); setUserFieldCustom(e.target.value); }} />
+              )}
+              {userCandidates.length > 0 && userField === CUSTOM_FIELD && (
+                <input type="text" className="w-full mt-1 bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]"
+                  placeholder="ctl00$cphMaster$txtUsername"
+                  value={userFieldCustom} onChange={e => setUserFieldCustom(e.target.value)} />
+              )}
             </div>
             <div>
-              <label className="text-xs text-[#8b949e] block mb-1">Password field name</label>
-              <input type="text" className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]"
-                value={passField} onChange={e => setPassField(e.target.value)} />
+              <label className="text-xs text-[#8b949e] block mb-1">Password field</label>
+              {passCandidates.length > 0 ? (
+                <select value={passField} onChange={e => setPassField(e.target.value)}
+                  className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]">
+                  {passCandidates.map(f => (
+                    <option key={f.name} value={f.name}>{f.name}</option>
+                  ))}
+                  <option value={CUSTOM_FIELD}>Other (type manually)…</option>
+                </select>
+              ) : (
+                <input type="text" className="w-full bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]"
+                  placeholder="ctl00$cphMaster$txtPassword"
+                  value={passField === CUSTOM_FIELD ? passFieldCustom : passField}
+                  onChange={e => { setPassField(CUSTOM_FIELD); setPassFieldCustom(e.target.value); }} />
+              )}
+              {passCandidates.length > 0 && passField === CUSTOM_FIELD && (
+                <input type="text" className="w-full mt-1 bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 text-[#c9d1d9] text-xs outline-none focus:border-[#58a6ff]"
+                  placeholder="ctl00$cphMaster$txtPassword"
+                  value={passFieldCustom} onChange={e => setPassFieldCustom(e.target.value)} />
+              )}
             </div>
           </div>
 
@@ -282,7 +395,7 @@ function LoginTab({ cookies, onCookies }: { cookies: Record<string, string>; onC
               <input type="checkbox" checked={verifySsl} onChange={e => setVerifySsl(e.target.checked)} />
               Verify SSL
             </label>
-            <button onClick={login} disabled={loading || !loginUrl || !username}
+            <button onClick={login} disabled={loading || !loginUrl || !username || !effectiveUserField || !effectivePassField}
               className="px-5 py-2 rounded font-bold text-sm bg-[#58a6ff] text-black hover:bg-[#79beff] disabled:opacity-50 transition">
               {loading ? "Logging in…" : "Login →"}
             </button>
