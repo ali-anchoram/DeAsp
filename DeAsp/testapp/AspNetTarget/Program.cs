@@ -30,7 +30,11 @@ app.Use(async (ctx, next) =>
 
 // ── Config ─────────────────────────────────────────────────────────────────
 const string MACHINE_KEY = "DeAspTestKey_NotSecure_ForTestingOnly_1234567890abcdef";
-const bool   MAC_ENABLED = true;   // set false to simulate disabled MAC
+const bool   MAC_ENABLED = true;    // whether a MAC is appended to outgoing ViewState
+const bool   MAC_VERIFIED = true;   // whether the MAC is actually checked on the way back in —
+                                     // the realistic vuln: MAC bytes are present (so a naive
+                                     // "is there a MAC?" check would say "protected"), but the
+                                     // server never validates them
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -55,7 +59,7 @@ string MakeViewState(string payload)
 
 bool VerifyViewState(string b64)
 {
-    if (!MAC_ENABLED) return true;
+    if (!MAC_ENABLED || !MAC_VERIFIED) return true;
     try
     {
         var data = Convert.FromBase64String(b64.Length % 4 == 0 ? b64 : b64 + new string('=', 4 - b64.Length % 4));

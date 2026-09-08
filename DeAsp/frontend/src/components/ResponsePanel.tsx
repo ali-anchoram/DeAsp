@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import type { ReplayResponse, AjaxPart } from "../types";
 import ViewStatePanel from "./ViewStatePanel";
 
@@ -10,25 +10,128 @@ function detectXss(content: string): string[] {
   return XSS_PROBES.filter(p => lc.includes(p.toLowerCase()));
 }
 
+// ── XSS Proof modal ────────────────────────────────────────────────────────────
+//
+// A pattern match ("contains '<script'") is a hint, not proof — the payload
+// could be sitting inside an HTML-encoded attribute, a <textarea>, a comment,
+// or otherwise inert. This renders the actual content in a sandboxed iframe
+// with scripting ALLOWED (so a genuine injection actually runs) but same-origin
+// access DENIED (unique opaque origin — no access to DeAsp's cookies, DOM, or
+// parent window beyond postMessage). A tiny harness overrides alert/prompt/
+// confirm to report back via postMessage, so execution is confirmed visibly
+// rather than relying on the browser's (often-blocked-in-sandboxes) native
+// dialogs.
+
+const XSS_HARNESS = `<script>
+(function(){
+  function report(kind, args){
+    try {
+      var msg = kind + "(" + Array.prototype.map.call(args, String).join(", ") + ")";
+      window.parent.postMessage({ __deaspXssProof: true, detail: msg }, "*");
+    } catch (e) {}
+  }
+  window.alert = function(){ report("alert", arguments); };
+  window.prompt = function(){ report("prompt", arguments); return null; };
+  window.confirm = function(){ report("confirm", arguments); return false; };
+})();
+</script>`;
+
+function XssProofModal({ html, matches, onClose }: { html: string; matches: string[]; onClose: () => void }) {
+  const [fired, setFired] = useState<string[]>([]);
+
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      if (e.data && e.data.__deaspXssProof) {
+        setFired(f => [...f, e.data.detail]);
+      }
+    }
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={onClose}>
+      <div
+        className="rounded-lg border border-[#f85149] bg-[#161b22] p-5 max-w-2xl w-full mx-4 max-h-[85vh] overflow-auto"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-[#f85149] font-bold text-lg">⚡ XSS Proof of Concept</h3>
+          <button onClick={onClose} className="text-[#8b949e] hover:text-white text-xl">✕</button>
+        </div>
+
+        <div className="text-xs text-[#8b949e] mb-3">
+          Matched pattern(s): <span className="text-[#f85149] font-mono">{matches.join(", ")}</span>
+        </div>
+
+        <div className="mb-1 text-xs text-[#8b949e] uppercase tracking-wider font-semibold">
+          Live execution — sandboxed, isolated origin (no cookie/DOM access to the real page)
+        </div>
+        <iframe
+          title="xss-proof"
+          sandbox="allow-scripts"
+          srcDoc={`<!doctype html><html><head>${XSS_HARNESS}</head><body>${html}</body></html>`}
+          className="w-full border border-[#30363d] rounded bg-white mb-3"
+          style={{ height: 200 }}
+        />
+
+        {fired.length > 0 ? (
+          <div className="rounded border border-[#f85149] bg-[#2d0d0d] px-3 py-2 mb-3">
+            <div className="text-[#f85149] font-bold text-xs mb-1">✅ CONFIRMED — JavaScript executed:</div>
+            {fired.map((f, i) => (
+              <div key={i} className="text-[#f85149] text-xs font-mono">{f}</div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 mb-3 text-[#8b949e] text-xs">
+            No alert/prompt/confirm call observed — the payload may use a technique this harness
+            doesn't intercept (DOM writes, fetch-based exfiltration, etc.), or the matched text
+            isn't actually executing (e.g. sitting inert inside an attribute or encoded elsewhere
+            on the real page). Check the rendered output above and raw HTML below.
+          </div>
+        )}
+
+        <div className="mb-1 text-xs text-[#8b949e] uppercase tracking-wider font-semibold">Raw content</div>
+        <pre className="bg-[#0d1117] border border-[#30363d] rounded p-2 text-[10px] text-[#c9d1d9] overflow-auto max-h-40 whitespace-pre-wrap break-all">
+          {html}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+function XssBadge({ matches, onProof }: { matches: string[]; onProof: () => void }) {
+  if (matches.length === 0) return null;
+  return (
+    <button
+      onClick={e => { e.stopPropagation(); onProof(); }}
+      className="text-[#f85149] text-[10px] font-bold bg-[#2d0d0d] px-2 py-0.5 rounded border border-[#f85149] animate-pulse hover:bg-[#f85149] hover:text-black transition cursor-pointer"
+      title="Click to see proof of execution"
+    >
+      ⚡ XSS? {matches[0]} — view proof
+    </button>
+  );
+}
+
 // ── Rendered HTML panel (iframe) ─────────────────────────────────────────────
 
 function RenderedHtml({ html, label }: { html: string; label: string }) {
   const [show, setShow] = useState(true);
+  const [showProof, setShowProof] = useState(false);
   const xssHits = detectXss(html);
 
   return (
     <div className="rounded border mt-2" style={{ borderColor: xssHits.length ? "#f85149" : "#30363d" }}>
-      <button
+      <div
+        role="button"
+        tabIndex={0}
         onClick={() => setShow(v => !v)}
-        className="w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-[#1a1f2e] transition text-left"
+        onKeyDown={e => { if (e.key === "Enter") setShow(v => !v); }}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-[#1a1f2e] transition text-left cursor-pointer"
       >
         <span className="font-semibold text-[#58a6ff]">🖥 {label}</span>
         <div className="flex items-center gap-2">
-          {xssHits.length > 0 && (
-            <span className="text-[#f85149] text-[10px] font-bold bg-[#2d0d0d] px-2 py-0.5 rounded border border-[#f85149] animate-pulse">
-              ⚡ XSS? {xssHits[0]}
-            </span>
-          )}
+          <XssBadge matches={xssHits} onProof={() => setShowProof(true)} />
           {xssHits.length === 0 && (
             <span className="text-[#56d364] text-[10px] bg-[#0a1f0c] px-2 py-0.5 rounded">
               ✓ No obvious XSS
@@ -36,7 +139,7 @@ function RenderedHtml({ html, label }: { html: string; label: string }) {
           )}
           <span className="text-[#8b949e]">{show ? "▲" : "▼"}</span>
         </div>
-      </button>
+      </div>
 
       {show && (
         <div className="border-t border-[#30363d]">
@@ -66,6 +169,8 @@ function RenderedHtml({ html, label }: { html: string; label: string }) {
           </details>
         </div>
       )}
+
+      {showProof && <XssProofModal html={html} matches={xssHits} onClose={() => setShowProof(false)} />}
     </div>
   );
 }
@@ -94,6 +199,7 @@ function AjaxPart({ part }: { part: AjaxPart }) {
   const [open, setOpen] = useState(
     part.highlight || part.is_error || part.type === "pageRedirect" || part.type === "updatePanel"
   );
+  const [showProof, setShowProof] = useState(false);
   const color = PART_COLOR[part.type] ?? "#8b949e";
   const isUpdatePanel = part.type === "updatePanel";
   const isScript = part.type === "scriptBlock" || part.type === "scriptStartupBlock";
@@ -102,21 +208,24 @@ function AjaxPart({ part }: { part: AjaxPart }) {
 
   return (
     <div className="rounded border mb-1.5" style={{ borderColor: part.is_error ? "#f85149" : xssHits.length ? "#f0883e" : "#30363d" }}>
-      <button
-        className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[#1a1f2e] text-xs transition"
+      <div
+        role="button"
+        tabIndex={0}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[#1a1f2e] text-xs transition cursor-pointer"
         onClick={() => setOpen(v => !v)}
+        onKeyDown={e => { if (e.key === "Enter") setOpen(v => !v); }}
       >
         <span className="font-bold flex-shrink-0" style={{ color }}>{part.type}</span>
         {part.id && <span className="text-[#8b949e] truncate max-w-[180px]">#{part.id}</span>}
         <span className="text-[#6e7681] flex-shrink-0">{part.length}B</span>
         {part.highlight && <span className="text-[#f0883e] text-[10px] font-bold flex-shrink-0">★ VS UPDATED</span>}
         {part.is_error && <span className="text-[#f85149] text-[10px] font-bold flex-shrink-0">⚠ ERROR</span>}
-        {xssHits.length > 0 && <span className="text-[#f85149] text-[10px] font-bold flex-shrink-0">⚡ XSS?</span>}
+        <XssBadge matches={xssHits} onProof={() => setShowProof(true)} />
         {part.text_preview && (
           <span className="text-[#8b949e] text-[10px] truncate flex-1 ml-1 italic">{part.text_preview.slice(0, 60)}</span>
         )}
         <span className="ml-auto text-[#8b949e] flex-shrink-0">{open ? "▲" : "▼"}</span>
-      </button>
+      </div>
 
       {open && (
         <div className="border-t border-[#30363d] px-3 py-2">
@@ -144,6 +253,8 @@ function AjaxPart({ part }: { part: AjaxPart }) {
           )}
         </div>
       )}
+
+      {showProof && <XssProofModal html={part.content} matches={xssHits} onClose={() => setShowProof(false)} />}
     </div>
   );
 }
@@ -161,6 +272,7 @@ const statusColor = (s: number) =>
 
 export default function ResponsePanel({ response, loading, renderPages }: Props) {
   const [tab, setTab] = useState<"pretty" | "rendered" | "ajax" | "headers">("pretty");
+  const [showProof, setShowProof] = useState(false);
 
   if (loading) {
     return (
@@ -213,11 +325,7 @@ export default function ResponsePanel({ response, loading, renderPages }: Props)
         {response.is_ajax && (
           <span className="text-[#bc8cff] text-[10px] font-bold bg-[#1c1440] px-2 py-0.5 rounded">AJAX</span>
         )}
-        {bodyXss.length > 0 && (
-          <span className="text-[#f85149] text-[10px] font-bold bg-[#2d0d0d] px-2 py-0.5 rounded border border-[#f85149] animate-pulse">
-            ⚡ XSS? {bodyXss[0]}
-          </span>
-        )}
+        <XssBadge matches={bodyXss} onProof={() => setShowProof(true)} />
       </div>
 
       {/* Tabs */}
@@ -263,6 +371,8 @@ export default function ResponsePanel({ response, loading, renderPages }: Props)
           </div>
         )}
       </div>
+
+      {showProof && <XssProofModal html={response.body} matches={bodyXss} onClose={() => setShowProof(false)} />}
     </div>
   );
 }

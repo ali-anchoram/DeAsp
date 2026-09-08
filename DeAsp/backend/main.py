@@ -46,6 +46,36 @@ def classify_param(name: str) -> str:
     return "user"
 
 
+# ── Response-level ViewState error detection ──────────────────────────────────
+#
+# Naively checking "does the body contain 'viewstate' AND 'invalid'/'mac'/
+# 'tamper' *anywhere*" false-positives constantly: __VIEWSTATE is the literal
+# name of a hidden field present on virtually every WebForms page, and words
+# like "invalid" show up in totally unrelated validation messages elsewhere
+# on the same page (e.g. "Invalid code, 2 attempts remaining"). A looser
+# proximity regex (both words within N characters of each other) still
+# false-positives on ordinary explanatory prose — e.g. "ViewState is
+# MAC-protected (tamper-proof) but NOT encrypted" easily satisfies most
+# proximity windows despite describing a page that's working exactly as
+# intended. So: match against actual known ASP.NET/IIS stock error phrases
+# and our own test app's literal error strings, not a generic heuristic.
+_VS_ERROR_PHRASES = (
+    "validation of viewstate mac failed",   # real ASP.NET stock error text
+    "state information is invalid for this page",  # real ASP.NET stock error text
+    "invalid viewstate",
+    "viewstate is invalid",
+    "viewstate mac failed",
+    "viewstate mac validation failed",
+    "viewstate validation failed",
+    "mac validation failed",
+)
+
+
+def looks_like_viewstate_error(body: str) -> bool:
+    bl = body.lower()
+    return any(p in bl for p in _VS_ERROR_PHRASES)
+
+
 # ── ViewState LOS decoder ─────────────────────────────────────────────────────
 
 class _LOS:
@@ -582,8 +612,7 @@ async def api_replay(inp: Replay):
             "ajax_parts": ajax_parts,
             "content_type": r.headers.get("Content-Type", ""),
             "aspnet_error": r.status_code == 500 or "Runtime Error" in body_text,
-            "viewstate_error": "viewstate" in body_text.lower() and
-                               any(x in body_text.lower() for x in ("invalid", "tamper", "mac")),
+            "viewstate_error": looks_like_viewstate_error(body_text),
             "new_cookies": _safe_httpx_cookie_dict(r.cookies),
         }
     except httpx.RequestError as e:
@@ -651,8 +680,7 @@ async def api_check_mac(inp: CheckMac):
     try:
         async with httpx.AsyncClient(verify=inp.verify_ssl, follow_redirects=False, timeout=30) as client:
             r = await client.request(inp.method, inp.url, headers=hdrs, content=new_body.encode())
-        bl = r.text.lower()
-        vs_err = any(x in bl for x in ("viewstate", "mac", "tamper", "invalid state", "state information"))
+        vs_err = looks_like_viewstate_error(r.text)
         if r.status_code == 500 or vs_err:
             result = "mac_enabled"; vuln = False
             msg = "MAC validation ENABLED — server rejected the tampered ViewState."
