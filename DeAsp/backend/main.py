@@ -331,6 +331,26 @@ def _cookie_dict(cookie_str: str) -> Dict[str, str]:
     return out
 
 
+def _safe_httpx_cookie_dict(cookies) -> Dict[str, str]:
+    """
+    Build a plain {name: value} dict from an httpx.Cookies jar.
+
+    httpx.Cookies.get()/__getitem__() (and therefore dict(cookies), which
+    uses them under the hood) raises CookieConflict as soon as the SAME
+    cookie name shows up more than once with a different domain/path —
+    e.g. the app sets 'CurrentUserFullName' at '/' and the client also
+    already holds one scoped to a specific path from an earlier response.
+    That's normal, valid cookie-jar state, not an error condition, so we
+    walk the underlying jar directly instead of using the conflict-raising
+    accessors. Last one encountered wins — fine here since this dict is
+    only used for display/reuse convenience, not strict cookie semantics.
+    """
+    out: Dict[str, str] = {}
+    for cookie in cookies.jar:
+        out[cookie.name] = cookie.value
+    return out
+
+
 def _cookie_str(d: Dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in d.items())
 
@@ -407,7 +427,7 @@ async def api_fetch_url(inp: FetchUrl):
             r = await client.get(inp.url, headers=hdrs)
 
         # Merge any new cookies from response
-        all_cookies = {**cookies, **dict(r.cookies)}
+        all_cookies = {**cookies, **_safe_httpx_cookie_dict(r.cookies)}
 
         soup = BeautifulSoup(r.text, "lxml")
         forms = []
@@ -507,7 +527,7 @@ async def api_login(inp: LoginFlow):
             )
 
         # Collect all cookies across redirects
-        all_cookies = {**init_cookies, **dict(client.cookies)}
+        all_cookies = {**init_cookies, **_safe_httpx_cookie_dict(client.cookies)}
         session_id = all_cookies.get("ASP.NET_SessionId")
 
         # Detect login success heuristically
@@ -564,7 +584,7 @@ async def api_replay(inp: Replay):
             "aspnet_error": r.status_code == 500 or "Runtime Error" in body_text,
             "viewstate_error": "viewstate" in body_text.lower() and
                                any(x in body_text.lower() for x in ("invalid", "tamper", "mac")),
-            "new_cookies": dict(r.cookies),
+            "new_cookies": _safe_httpx_cookie_dict(r.cookies),
         }
     except httpx.RequestError as e:
         raise HTTPException(502, f"Request failed: {e}")
