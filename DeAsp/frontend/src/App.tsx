@@ -33,6 +33,31 @@ function cookieDictToStr(d: Record<string, string>): string {
   return Object.entries(d).map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+// Cookie jar persistence — a refresh (or an accidental one) shouldn't throw
+// away a session you just authenticated. Scoped to this browser tab's origin
+// only, same as any other client-side storage; never sent anywhere.
+const COOKIE_STORAGE_KEY = "deasp:cookies";
+
+function loadStoredCookies(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(COOKIE_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function storeCookies(cookies: Record<string, string>) {
+  try {
+    localStorage.setItem(COOKIE_STORAGE_KEY, JSON.stringify(cookies));
+  } catch {
+    // private browsing / storage disabled / quota exceeded — fall back to
+    // in-memory-only behavior rather than breaking the app
+  }
+}
+
 // ── Cookie Manager ────────────────────────────────────────────────────────────
 
 function CookieManager({
@@ -864,7 +889,14 @@ function ViewstateTab() {
 
 export default function App() {
   const [tab, setTab]           = useState<TabId>("fetch");
-  const [cookies, setCookies]   = useState<Record<string, string>>({});
+  const [cookies, setCookiesState] = useState<Record<string, string>>(() => loadStoredCookies());
+
+  // Persist on every change so a refresh (accidental or not) keeps the
+  // session you just logged into, instead of forgetting it silently.
+  const setCookies = useCallback((c: Record<string, string>) => {
+    setCookiesState(c);
+    storeCookies(c);
+  }, []);
 
   const tabs: { id: TabId; label: string; desc: string }[] = [
     { id: "fetch",     label: "Attack",   desc: "Fetch URL → edit → send" },
