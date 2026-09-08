@@ -5,49 +5,96 @@ import ViewStatePanel from "./ViewStatePanel";
 // XSS patterns to look for in content
 const XSS_PROBES = ["<script", "javascript:", "onerror=", "onload=", "onfocus=", "alert(", "prompt(", "confirm(", "document.cookie", "eval(", "innerHTML"];
 
+// Patterns so commonly used for entirely benign UI purposes (e.g. href="javascript:void(0)"
+// as a no-op link idiom) that flagging them with the same urgency as the others is more
+// noise than signal. Still shown as a low-priority match with context, never hidden.
+const XSS_LOW_PRIORITY = new Set(["javascript:"]);
+
 function detectXss(content: string): string[] {
   const lc = content.toLowerCase();
-  return XSS_PROBES.filter(p => lc.includes(p.toLowerCase()));
+  const hits = XSS_PROBES.filter(p => lc.includes(p.toLowerCase()));
+  // Sort so a genuinely dangerous match (e.g. "<script") leads the badge text
+  // over a low-priority one (e.g. "javascript:") when both are present.
+  return hits.sort((a, b) => Number(XSS_LOW_PRIORITY.has(a)) - Number(XSS_LOW_PRIORITY.has(b)));
+}
+
+/** ~50 chars of context around each matched pattern's first occurrence, so a
+ *  benign idiom like javascript:void(0) is visually distinguishable from a
+ *  real payload without hunting through the raw content by hand. */
+function matchContexts(content: string, matches: string[]): { pattern: string; context: string }[] {
+  const lc = content.toLowerCase();
+  return matches.map(pattern => {
+    const idx = lc.indexOf(pattern.toLowerCase());
+    if (idx === -1) return { pattern, context: "" };
+    const start = Math.max(0, idx - 30);
+    const end = Math.min(content.length, idx + pattern.length + 40);
+    const prefix = start > 0 ? "…" : "";
+    const suffix = end < content.length ? "…" : "";
+    return { pattern, context: prefix + content.slice(start, end) + suffix };
+  });
 }
 
 // ── XSS Proof modal ────────────────────────────────────────────────────────────
 //
 // A pattern match ("contains '<script'") is a hint, not proof — the payload
 // could be sitting inside an HTML-encoded attribute, a <textarea>, a comment,
-// or otherwise inert. This renders the actual content in a sandboxed iframe
-// with scripting ALLOWED (so a genuine injection actually runs) but same-origin
-// access DENIED (unique opaque origin — no access to DeAsp's cookies, DOM, or
-// parent window beyond postMessage). A tiny harness overrides alert/prompt/
-// confirm to report back via postMessage, so execution is confirmed visibly
-// rather than relying on the browser's (often-blocked-in-sandboxes) native
-// dialogs.
-
+// or a harmless idiom like href="javascript:void(0)". This renders the actual
+// content in a sandboxed iframe with scripting ALLOWED (so a genuine injection
+// actually runs) but same-origin access DENIED (unique opaque origin — no
+// access to DeAsp's cookies, DOM, or parent window beyond postMessage). A
+// harness overrides alert/prompt/confirm, document.cookie, fetch, and
+// XMLHttpRequest.open to report back via postMessage whenever the payload
+// does any of the things real XSS exploits actually do, plus a canary that
+// confirms the sandbox's JS environment itself came up — so "nothing fired"
+// can be told apart from "the harness never even loaded."
 const XSS_HARNESS = `<script>
 (function(){
-  function report(kind, args){
-    try {
-      var msg = kind + "(" + Array.prototype.map.call(args, String).join(", ") + ")";
-      window.parent.postMessage({ __deaspXssProof: true, detail: msg }, "*");
-    } catch (e) {}
+  function report(kind, detail){
+    try { window.parent.postMessage({ __deaspXssProof: true, kind: kind, detail: detail }, "*"); } catch (e) {}
   }
-  window.alert = function(){ report("alert", arguments); };
-  window.prompt = function(){ report("prompt", arguments); return null; };
-  window.confirm = function(){ report("confirm", arguments); return false; };
+  window.alert = function(){ report("alert", "alert(" + Array.prototype.map.call(arguments, String).join(", ") + ")"); };
+  window.prompt = function(){ report("prompt", "prompt(" + Array.prototype.map.call(arguments, String).join(", ") + ")"); return null; };
+  window.confirm = function(){ report("confirm", "confirm(" + Array.prototype.map.call(arguments, String).join(", ") + ")"); return false; };
+  try {
+    Object.defineProperty(document, "cookie", {
+      get: function(){ report("cookie-read", "document.cookie was read"); return ""; },
+      set: function(v){ report("cookie-write", "document.cookie = " + v); },
+      configurable: true,
+    });
+  } catch (e) {}
+  var origFetch = window.fetch;
+  window.fetch = function(url){ report("network", "fetch(" + url + ")"); return origFetch ? origFetch.apply(this, arguments) : Promise.reject(new Error("blocked")); };
+  if (window.XMLHttpRequest) {
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url){ report("network", "XHR " + method + " " + url); return origOpen.apply(this, arguments); };
+  }
+  window.addEventListener("error", function(e){ report("script-error", "Script error: " + e.message); });
+  report("harness-loaded", "sandbox JS environment is running");
 })();
 </script>`;
 
+const EVENT_LABEL: Record<string, string> = {
+  alert: "alert() called", prompt: "prompt() called", confirm: "confirm() called",
+  "cookie-read": "document.cookie read", "cookie-write": "document.cookie written",
+  network: "outbound request attempted", "script-error": "script ran and threw an error",
+};
+
 function XssProofModal({ html, matches, onClose }: { html: string; matches: string[]; onClose: () => void }) {
-  const [fired, setFired] = useState<string[]>([]);
+  const [fired, setFired] = useState<{ kind: string; detail: string }[]>([]);
 
   useEffect(() => {
     function onMsg(e: MessageEvent) {
       if (e.data && e.data.__deaspXssProof) {
-        setFired(f => [...f, e.data.detail]);
+        setFired(f => [...f, { kind: e.data.kind, detail: e.data.detail }]);
       }
     }
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
   }, []);
+
+  const harnessLoaded = fired.some(f => f.kind === "harness-loaded");
+  const payloadEvents = fired.filter(f => f.kind !== "harness-loaded");
+  const contexts = matchContexts(html, matches);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={onClose}>
@@ -60,8 +107,21 @@ function XssProofModal({ html, matches, onClose }: { html: string; matches: stri
           <button onClick={onClose} className="text-[#8b949e] hover:text-white text-xl">✕</button>
         </div>
 
-        <div className="text-xs text-[#8b949e] mb-3">
-          Matched pattern(s): <span className="text-[#f85149] font-mono">{matches.join(", ")}</span>
+        <div className="text-xs text-[#8b949e] mb-1 uppercase tracking-wider font-semibold">Matched pattern(s) — with context</div>
+        <div className="space-y-1 mb-3">
+          {contexts.map(({ pattern, context }, i) => (
+            <div key={i} className="flex gap-2 items-start">
+              <span
+                className="text-[10px] font-mono px-1.5 py-0.5 rounded flex-shrink-0"
+                style={XSS_LOW_PRIORITY.has(pattern)
+                  ? { color: "#8b949e", background: "#1a1d23" }
+                  : { color: "#f85149", background: "#2d0d0d" }}
+              >
+                {pattern}
+              </span>
+              <span className="text-[10px] font-mono text-[#8b949e] break-all">{context}</span>
+            </div>
+          ))}
         </div>
 
         <div className="mb-1 text-xs text-[#8b949e] uppercase tracking-wider font-semibold">
@@ -75,19 +135,26 @@ function XssProofModal({ html, matches, onClose }: { html: string; matches: stri
           style={{ height: 200 }}
         />
 
-        {fired.length > 0 ? (
+        {payloadEvents.length > 0 ? (
           <div className="rounded border border-[#f85149] bg-[#2d0d0d] px-3 py-2 mb-3">
             <div className="text-[#f85149] font-bold text-xs mb-1">✅ CONFIRMED — JavaScript executed:</div>
-            {fired.map((f, i) => (
-              <div key={i} className="text-[#f85149] text-xs font-mono">{f}</div>
+            {payloadEvents.map((f, i) => (
+              <div key={i} className="text-[#f85149] text-xs font-mono">
+                {EVENT_LABEL[f.kind] ?? f.kind}: {f.detail}
+              </div>
             ))}
+          </div>
+        ) : harnessLoaded ? (
+          <div className="rounded border border-[#f0883e] bg-[#2d1b00] px-3 py-2 mb-3 text-[#f0883e] text-xs">
+            ⚠ Sandbox's own JS ran fine, but the payload triggered nothing observable —
+            it may be inert (sitting inside an attribute, encoded, or in a &lt;textarea&gt;),
+            or it uses a technique this harness doesn't track (direct DOM writes with no
+            side effect we watch for). Check the rendered output and raw content below.
           </div>
         ) : (
           <div className="rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 mb-3 text-[#8b949e] text-xs">
-            No alert/prompt/confirm call observed — the payload may use a technique this harness
-            doesn't intercept (DOM writes, fetch-based exfiltration, etc.), or the matched text
-            isn't actually executing (e.g. sitting inert inside an attribute or encoded elsewhere
-            on the real page). Check the rendered output above and raw HTML below.
+            The sandbox's own script never ran — something in the content likely broke HTML
+            parsing before reaching it (e.g. an unclosed tag/quote). Check the raw content below.
           </div>
         )}
 
@@ -305,8 +372,19 @@ export default function ResponsePanel({ response, loading, renderPages }: Props)
   const firstTab = (tabs[0] as typeof tab) ?? "pretty";
   const activeTab = tabs.includes(tab as typeof tabs[number]) ? tab : firstTab;
 
-  // XSS check on full body
-  const bodyXss = detectXss(response.body);
+  // For AJAX responses, response.body is the raw pipe-delimited envelope
+  // ("735|updatePanel|id|<div>...</div>|0|hiddenField|..."), not HTML. Testing
+  // that directly in an iframe is misleading — a real payload can end up
+  // buried in protocol noise instead of being evaluated cleanly. Use the
+  // already-parsed updatePanel/script content (the pieces that actually get
+  // injected into the real page's DOM) for both detection and the proof view.
+  const proofContent = response.is_ajax
+    ? response.ajax_parts
+        .filter(p => p.type === "updatePanel" || p.type === "scriptBlock" || p.type === "scriptStartupBlock")
+        .map(p => p.content)
+        .join("\n")
+    : response.body;
+  const bodyXss = detectXss(proofContent);
 
   return (
     <div className="flex flex-col h-full">
@@ -372,7 +450,7 @@ export default function ResponsePanel({ response, loading, renderPages }: Props)
         )}
       </div>
 
-      {showProof && <XssProofModal html={response.body} matches={bodyXss} onClose={() => setShowProof(false)} />}
+      {showProof && <XssProofModal html={proofContent} matches={bodyXss} onClose={() => setShowProof(false)} />}
     </div>
   );
 }
